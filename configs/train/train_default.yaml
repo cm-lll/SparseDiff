@@ -4,7 +4,7 @@ batch_size: 512
 lr: 0.0002
 clip_grad: null          # float, null to disable
 save_model: True
-num_workers: 0
+num_workers: 16             # Increased for faster data loading (48 CPUs available)
 progress_bar: false
 weight_decay: 1e-12
 optimizer: adamw

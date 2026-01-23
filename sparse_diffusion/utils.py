@@ -22,6 +22,8 @@ def setup_wandb(cfg):
     name = cfg.dataset.name
     if name == "qm9" and cfg.dataset.remove_h == False:
         name = "qm9_h"
+    
+    # wandb will automatically use HTTP_PROXY and HTTPS_PROXY from environment
     kwargs = {
         "name": cfg.general.name,
         "project": f"sparse_{name}",

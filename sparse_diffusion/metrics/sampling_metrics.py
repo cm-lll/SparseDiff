@@ -65,6 +65,9 @@ class SamplingMetrics(nn.Module):
                 self.domain_metrics = PointCloudSamplingMetrics(dataloaders=dataloaders, test=test)
             elif dataset_infos.dataset_name == "ego":
                 self.domain_metrics = EgoSamplingMetrics(dataloaders=dataloaders, test=test)
+            elif dataset_infos.dataset_name == "acm_subgraphs":
+                # acm_subgraphs 使用通用指标，不设置 domain_metrics
+                self.domain_metrics = None
             else:
                 raise ValueError(
                     "Dataset {} not implemented".format(dataset_infos.dataset_name)
@@ -158,7 +161,13 @@ def number_nodes_distance(generated_graphs, dataset_counts):
 def node_types_distance(generated_graphs, target, save_histogram=True):
     generated_distribution = torch.zeros_like(target)
 
-    for node in generated_graphs.node:
+    # generated_graphs.node 可能是 one-hot 编码 (N, dx) 或离散值 (N,)
+    node_types = generated_graphs.node
+    if node_types.dim() > 1 and node_types.shape[-1] > 1:
+        # one-hot 编码，需要 argmax
+        node_types = torch.argmax(node_types, dim=-1)
+    
+    for node in node_types:
         generated_distribution[node] += 1
 
     if save_histogram:
@@ -178,6 +187,11 @@ def bond_types_distance(generated_graphs, target, save_histogram=True):
     edge_index, edge_attr = utils.undirected_to_directed(
         generated_graphs.edge_index, generated_graphs.edge_attr
     )
+    # edge_attr 可能是 one-hot 编码 (M, de) 或离散值 (M,)
+    if edge_attr.dim() > 1 and edge_attr.shape[-1] > 1:
+        # one-hot 编码，需要 argmax
+        edge_attr = torch.argmax(edge_attr, dim=-1)
+    
     for edge in edge_attr:
         generated_distribution[edge] += 1
 
@@ -211,7 +225,12 @@ def connected_components(generated_graphs):
         # get the graph
         node_mask = batch == i
         edge_mask = edge_batch == i
-        node = generated_graphs.node[node_mask]
+        node_types = generated_graphs.node[node_mask]
+        # 如果是 one-hot 编码，需要 argmax（但这里只需要节点数量，不需要实际类型）
+        if node_types.dim() > 1 and node_types.shape[-1] > 1:
+            node = torch.argmax(node_types, dim=-1)
+        else:
+            node = node_types
         edge_index = generated_graphs.edge_index[:, edge_mask] - generated_graphs.ptr[i]
         # DENSE OPERATIONS
         sp_adj = to_scipy_sparse_matrix(edge_index, num_nodes=len(node))

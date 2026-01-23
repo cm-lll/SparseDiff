@@ -239,6 +239,115 @@ def sample_query_edges(
     return edge_index, batch
 
 
+def sample_non_existing_edges_batched_heterogeneous(
+    num_edges_to_sample, existing_edge_index, num_nodes, batch, src_mask, dst_mask
+):
+    """Sample non-existing edges from a heterogeneous graph with endpoint type constraints.
+    
+    This function only samples edges from src_type nodes to dst_type nodes.
+    
+    Args:
+        num_edges_to_sample: (bs) long - number of edges to sample per batch
+        existing_edge_index: (2, E) - existing edges (directed, upper triangle)
+        num_nodes: (bs) long - number of nodes per graph
+        batch: (N) long - batch assignment for each node
+        src_mask: (N) bool - mask for source type nodes
+        dst_mask: (N) bool - mask for destination type nodes
+    
+    Returns:
+        edge_index: (2, E_sample) - sampled edge indices
+    """
+    device = existing_edge_index.device
+    bs = len(num_edges_to_sample)
+    
+    # Compute node offsets for each batch
+    offset = torch.cumsum(num_nodes, dim=0)[:-1]  # (bs - 1)
+    offset = torch.cat((torch.zeros(1, device=device, dtype=torch.long), offset))  # (bs)
+    
+    # For each batch, collect all possible edges (src_type -> dst_type) and existing edges
+    all_sampled_edges = []
+    
+    for b in range(bs):
+        batch_mask = (batch == b)
+        batch_src_mask = src_mask & batch_mask
+        batch_dst_mask = dst_mask & batch_mask
+        
+        # Get node indices within this batch
+        batch_src_nodes = torch.where(batch_src_mask)[0]  # Global node indices
+        batch_dst_nodes = torch.where(batch_dst_mask)[0]  # Global node indices
+        
+        # Convert to local indices (within batch)
+        local_src_nodes = batch_src_nodes - offset[b]
+        local_dst_nodes = batch_dst_nodes - offset[b]
+        
+        # Create all possible edges (src -> dst) as a cartesian product
+        # For directed graphs, we consider all src -> dst pairs
+        num_src = len(local_src_nodes)
+        num_dst = len(local_dst_nodes)
+        
+        if num_src == 0 or num_dst == 0:
+            # No valid edges for this batch
+            continue
+        
+        # Create all possible edge pairs using vectorized operations
+        src_indices = local_src_nodes.unsqueeze(1).expand(-1, num_dst).flatten()  # (num_src * num_dst,)
+        dst_indices = local_dst_nodes.unsqueeze(0).expand(num_src, -1).flatten()  # (num_src * num_dst,)
+        
+        # Convert to global node indices
+        global_src_indices = src_indices + offset[b]
+        global_dst_indices = dst_indices + offset[b]
+        
+        # Create edge index for all possible edges
+        all_possible_edges = torch.stack([global_src_indices, global_dst_indices])  # (2, num_possible)
+        
+        # Get existing edges for this batch
+        existing_batch_mask = batch[existing_edge_index[0]] == b
+        if existing_batch_mask.any():
+            existing_edges_b = existing_edge_index[:, existing_batch_mask]  # (2, E_b)
+        else:
+            existing_edges_b = torch.empty((2, 0), dtype=torch.long, device=device)
+        
+        # Remove existing edges from all possible edges using vectorized operations
+        if existing_edges_b.shape[1] > 0:
+            # Use vectorized comparison to find non-existing edges
+            # Compare each possible edge with all existing edges
+            # Shape: (num_possible, E_b) for each dimension
+            src_match = (all_possible_edges[0:1, :].T == existing_edges_b[0:1, :])  # (num_possible, E_b)
+            dst_match = (all_possible_edges[1:2, :].T == existing_edges_b[1:2, :])  # (num_possible, E_b)
+            both_match = src_match & dst_match  # (num_possible, E_b)
+            is_existing = both_match.any(dim=1)  # (num_possible,)
+            
+            # Filter out existing edges
+            non_existing_mask = ~is_existing
+            non_existing_edges = all_possible_edges[:, non_existing_mask]
+        else:
+            non_existing_edges = all_possible_edges
+        
+        # Sample from non-existing edges
+        num_to_sample = int(num_edges_to_sample[b].item())
+        num_available = non_existing_edges.shape[1]
+        
+        if num_available == 0:
+            continue
+        
+        if num_to_sample > num_available:
+            # Sample all available edges
+            sampled_indices = torch.arange(num_available, device=device)
+        else:
+            # Randomly sample without replacement
+            sampled_indices = torch.randperm(num_available, device=device)[:num_to_sample]
+        
+        sampled_edges_b = non_existing_edges[:, sampled_indices]
+        all_sampled_edges.append(sampled_edges_b)
+    
+    if len(all_sampled_edges) == 0:
+        return torch.empty((2, 0), dtype=torch.long, device=device)
+    
+    # Concatenate all sampled edges
+    edge_index = torch.cat(all_sampled_edges, dim=1)
+    return edge_index
+
+
 def sample_non_existing_edges_batched(
     num_edges_to_sample, existing_edge_index, num_nodes, batch
 ):

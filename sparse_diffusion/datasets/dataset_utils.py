@@ -2,13 +2,25 @@ import os.path as osp
 import pickle
 from typing import Any, Sequence
 
-from rdkit import Chem
+# NOTE: RDKit is only required for molecular datasets. Import lazily so that
+# non-molecular datasets (e.g., ACM_subgraphs) can run even if RDKit is missing
+# or has binary compatibility issues on the system.
+try:
+    from rdkit import Chem  # type: ignore
+except Exception as _e:  # pragma: no cover
+    Chem = None  # type: ignore
+    _RDKIT_IMPORT_ERROR = _e  # noqa: N816
 import torch
 from torch_geometric.data import Data
 from torch_geometric.utils import subgraph
 
 
 def mol_to_torch_geometric(mol, atom_encoder, smiles):
+    if Chem is None:  # pragma: no cover
+        raise ImportError(
+            "RDKit is required for molecular datasets, but it could not be imported. "
+            f"Original error: {_RDKIT_IMPORT_ERROR}"
+        )
     adj = torch.from_numpy(Chem.rdmolops.GetAdjacencyMatrix(mol, useBO=True))
     edge_index = adj.nonzero().contiguous().T
     bond_types = adj[edge_index[0], edge_index[1]]

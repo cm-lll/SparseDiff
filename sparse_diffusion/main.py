@@ -36,7 +36,7 @@ def main(cfg: DictConfig):
     pl.seed_everything(cfg.train.seed)
 
     print("creating datasets")
-    if dataset_config["name"] in ["sbm", "comm20", "planar", "ego"]:
+    if dataset_config["name"] in ["sbm", "comm20", "planar", "ego", "acm_subgraphs"]:
         from datasets.spectre_dataset_pyg import (
             SBMDataModule,
             Comm20DataModule,
@@ -44,20 +44,28 @@ def main(cfg: DictConfig):
             PlanarDataModule,
             SpectreDatasetInfos,
         )
-
-        if dataset_config["name"] == "sbm":
-            datamodule = SBMDataModule(cfg)
-        elif dataset_config["name"] == "comm20":
-            datamodule = Comm20DataModule(cfg)
-        elif dataset_config["name"] == "ego":
-            datamodule = EgoDataModule(cfg)
+        if dataset_config["name"] == "acm_subgraphs":
+            from datasets.acm_subgraphs_dataset import ACMSubgraphsDataModule, ACMSubgraphsInfos
+            datamodule = ACMSubgraphsDataModule(cfg)
+            dataset_infos = ACMSubgraphsInfos(datamodule)
+            train_metrics = TrainAbstractMetricsDiscrete()
+            domain_features = DummyExtraFeatures()
+            dataloaders = datamodule.dataloaders
         else:
-            datamodule = PlanarDataModule(cfg)
 
-        dataset_infos = SpectreDatasetInfos(datamodule)
-        train_metrics = TrainAbstractMetricsDiscrete()
-        domain_features = DummyExtraFeatures()
-        dataloaders = datamodule.dataloaders
+            if dataset_config["name"] == "sbm":
+                datamodule = SBMDataModule(cfg)
+            elif dataset_config["name"] == "comm20":
+                datamodule = Comm20DataModule(cfg)
+            elif dataset_config["name"] == "ego":
+                datamodule = EgoDataModule(cfg)
+            else:
+                datamodule = PlanarDataModule(cfg)
+
+            dataset_infos = SpectreDatasetInfos(datamodule)
+            train_metrics = TrainAbstractMetricsDiscrete()
+            domain_features = DummyExtraFeatures()
+            dataloaders = datamodule.dataloaders
 
     elif dataset_config["name"] == "protein":
         from datasets import protein_dataset

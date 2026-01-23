@@ -209,13 +209,27 @@ class AbstractDatasetInfos:
             self.input_dims.E += ex_extra_feat.E.size(-1)
             self.input_dims.y += ex_extra_feat.y.size(-1)
         except:
-            self.input_dims.X += ex_extra_feat.node.size(-1)
-            self.input_dims.E += ex_extra_feat.edge_attr.size(-1)
-            self.input_dims.y += ex_extra_feat.y.size(-1)
+            # 兼容旧格式（SparsePlaceHolder 或其他格式）
+            if hasattr(ex_extra_feat, 'node'):
+                self.input_dims.X += ex_extra_feat.node.size(-1)
+                self.input_dims.E += ex_extra_feat.edge_attr.size(-1)
+                self.input_dims.y += ex_extra_feat.y.size(-1)
+            else:
+                # 如果都没有，跳过（DummyExtraFeatures 返回空特征）
+                pass
             
         mol_extra_feat = domain_features(example_data)
         if type(mol_extra_feat) == tuple:
             mol_extra_feat = mol_extra_feat[0]
-        self.input_dims.X += mol_extra_feat.node.size(-1)
-        self.input_dims.E += mol_extra_feat.edge_attr.size(-1)
-        self.input_dims.y += mol_extra_feat.y.size(-1)
+        # 兼容 PlaceHolder 和旧格式
+        if hasattr(mol_extra_feat, 'X'):
+            self.input_dims.X += mol_extra_feat.X.size(-1)
+            self.input_dims.E += mol_extra_feat.E.size(-1)
+            self.input_dims.y += mol_extra_feat.y.size(-1)
+        elif hasattr(mol_extra_feat, 'node'):
+            self.input_dims.X += mol_extra_feat.node.size(-1)
+            self.input_dims.E += mol_extra_feat.edge_attr.size(-1)
+            self.input_dims.y += mol_extra_feat.y.size(-1)
+        else:
+            # 如果都没有，跳过（DummyExtraFeatures 返回空特征）
+            pass

@@ -419,6 +419,150 @@ def posterior_distributions(X, E, X_t, E_t, y_t, Qt, Qsb, Qtb, charge, charge_t)
     return PlaceHolder(X=prob_X, E=prob_E, y=y_t, charge=prob_charge)
 
 
+def posterior_distributions_heterogeneous(
+    X, E, E_t, X_t, y_t, Qt_dict, Qsb_dict, Qtb_dict, 
+    edge_family_offsets, num_global_states, charge=None, charge_t=None, Qt_charge=None, Qsb_charge=None, Qtb_charge=None
+):
+    """
+    为异质图计算后验分布，为每个关系族使用独立的转移矩阵
+    
+    Args:
+        X: (bs, n, dx) 节点特征
+        E: (bs, n, n, de) 边特征（全局状态空间）
+        E_t: (bs, n, n, de) 噪声边特征
+        X_t: (bs, n, dx) 噪声节点特征
+        y_t: (bs, dy) 图级别特征
+        Qt_dict: Dict[str, PlaceHolder] - 每个关系族的单步转移矩阵
+        Qsb_dict: Dict[str, PlaceHolder] - 每个关系族的累积转移矩阵（s步）
+        Qtb_dict: Dict[str, PlaceHolder] - 每个关系族的累积转移矩阵（t步）
+        edge_family_offsets: Dict[str, int] - 每个关系族的全局ID偏移
+        num_global_states: int - 全局状态空间大小
+        charge: (bs, n, d_charge) 电荷特征
+        charge_t: (bs, n, d_charge) 噪声电荷特征
+        Qt_charge, Qsb_charge, Qtb_charge: 电荷的转移矩阵
+    
+    Returns:
+        PlaceHolder(X=prob_X, E=prob_E, y=y_t, charge=prob_charge)
+    """
+    # 节点和电荷的后验分布（使用全局转移矩阵，因为它们不受关系族影响）
+    # 使用第一个关系族的转移矩阵的X部分（所有关系族共享节点转移矩阵）
+    first_fam_name = list(Qt_dict.keys())[0]
+    Qt_X = Qt_dict[first_fam_name].X
+    Qsb_X = Qsb_dict[first_fam_name].X
+    Qtb_X = Qtb_dict[first_fam_name].X
+    
+    prob_X = compute_posterior_distribution(
+        M=X, M_t=X_t, Qt_M=Qt_X, Qsb_M=Qsb_X, Qtb_M=Qtb_X
+    )  # (bs, n, dx)
+    
+    prob_charge = None
+    if charge is not None and charge_t is not None and Qt_charge is not None:
+        prob_charge = compute_posterior_distribution(
+            M=charge, M_t=charge_t, Qt_M=Qt_charge, Qsb_M=Qsb_charge, Qtb_M=Qtb_charge
+        )
+    
+    # 边的后验分布：为每个关系族独立计算
+    bs, n, n, de = E.shape
+    E_flat = E.reshape(bs, n * n, de)  # (bs, n*n, de)
+    E_t_flat = E_t.reshape(bs, n * n, de)  # (bs, n*n, de)
+    
+    # 根据 E_t 的全局ID推断每个边属于哪个关系族
+    E_t_discrete = E_t_flat.argmax(dim=-1)  # (bs, n*n) - 全局ID
+    
+    # 初始化全局状态空间的概率
+    prob_E_flat = torch.zeros_like(E_flat)  # (bs, n*n, de)
+    
+    # 为每个关系族计算后验分布
+    for fam_name, offset in edge_family_offsets.items():
+        if fam_name not in Qt_dict:
+            continue
+        
+        # 找到下一个关系族的offset
+        next_offset = num_global_states
+        for other_fam_name, other_offset in edge_family_offsets.items():
+            if other_offset > offset and other_offset < next_offset:
+                next_offset = other_offset
+        
+        # 判断哪些边属于这个关系族
+        # 边属于该关系族如果：E_t == 0 (no-edge) 或 E_t 在 [offset, next_offset) 范围内
+        fam_mask = (E_t_discrete == 0) | ((E_t_discrete >= offset) & (E_t_discrete < next_offset))  # (bs, n*n)
+        
+        if not fam_mask.any():
+            continue
+        
+        # 获取该关系族的边
+        E_fam = E_flat[fam_mask]  # (num_edges_fam, de)
+        E_t_fam = E_t_flat[fam_mask]  # (num_edges_fam, de)
+        
+        # 获取该关系族的转移矩阵
+        Qt_fam = Qt_dict[fam_name].E  # (bs, num_fam_states, num_fam_states)
+        Qsb_fam = Qsb_dict[fam_name].E  # (bs, num_fam_states, num_fam_states)
+        Qtb_fam = Qtb_dict[fam_name].E  # (bs, num_fam_states, num_fam_states)
+        
+        # 将全局状态转换为局部状态
+        E_t_fam_discrete = E_t_fam.argmax(dim=-1)  # (num_edges_fam,)
+        E_t_fam_local = E_t_fam_discrete.clone()
+        non_zero_mask = E_t_fam_local != 0
+        if non_zero_mask.any():
+            E_t_fam_local[non_zero_mask] = E_t_fam_local[non_zero_mask] - offset + 1
+        
+        # 转换为局部状态的one-hot编码
+        num_fam_states = Qt_fam.shape[-1]
+        E_t_fam_local_onehot = torch.nn.functional.one_hot(
+            E_t_fam_local.long(), num_classes=num_fam_states
+        ).float()  # (num_edges_fam, num_fam_states)
+        
+        # 同样处理 E_fam
+        E_fam_discrete = E_fam.argmax(dim=-1)  # (num_edges_fam,)
+        E_fam_local = E_fam_discrete.clone()
+        non_zero_mask = E_fam_local != 0
+        if non_zero_mask.any():
+            E_fam_local[non_zero_mask] = E_fam_local[non_zero_mask] - offset + 1
+        E_fam_local_onehot = torch.nn.functional.one_hot(
+            E_fam_local.long(), num_classes=num_fam_states
+        ).float()  # (num_edges_fam, num_fam_states)
+        
+        # 获取每个边所属的batch
+        batch_indices = torch.arange(bs, device=E.device).repeat_interleave(
+            (fam_mask.sum(dim=1))  # 每个batch中属于该关系族的边数
+        )[:fam_mask.sum()]
+        
+        # 为每个边选择对应的batch转移矩阵
+        Qt_fam_batch = Qt_fam[batch_indices]  # (num_edges_fam, num_fam_states, num_fam_states)
+        Qsb_fam_batch = Qsb_fam[batch_indices]  # (num_edges_fam, num_fam_states, num_fam_states)
+        Qtb_fam_batch = Qtb_fam[batch_indices]  # (num_edges_fam, num_fam_states, num_fam_states)
+        
+        # 计算局部状态空间的后验分布
+        prob_E_fam_local = compute_posterior_distribution(
+            M=E_fam_local_onehot.unsqueeze(0),  # (1, num_edges_fam, num_fam_states)
+            M_t=E_t_fam_local_onehot.unsqueeze(0),  # (1, num_edges_fam, num_fam_states)
+            Qt_M=Qt_fam_batch.unsqueeze(0),  # (1, num_edges_fam, num_fam_states, num_fam_states)
+            Qsb_M=Qsb_fam_batch.unsqueeze(0),  # (1, num_edges_fam, num_fam_states, num_fam_states)
+            Qtb_M=Qtb_fam_batch.unsqueeze(0),  # (1, num_edges_fam, num_fam_states, num_fam_states)
+        )  # (1, num_edges_fam, num_fam_states)
+        prob_E_fam_local = prob_E_fam_local.squeeze(0)  # (num_edges_fam, num_fam_states)
+        
+        # 映射回全局状态空间
+        prob_E_fam_global = torch.zeros(
+            (prob_E_fam_local.shape[0], num_global_states),
+            device=E.device, dtype=prob_E_fam_local.dtype
+        )
+        for local_state in range(num_fam_states):
+            if local_state == 0:
+                global_state = 0
+            else:
+                global_state = offset + local_state - 1
+            if global_state < num_global_states:
+                prob_E_fam_global[:, global_state] = prob_E_fam_local[:, local_state]
+        
+        # 填充到全局概率矩阵
+        prob_E_flat[fam_mask] = prob_E_fam_global
+    
+    prob_E = prob_E_flat.reshape(bs, n, n, de)
+    
+    return PlaceHolder(X=prob_X, E=prob_E, y=y_t, charge=prob_charge)
+
+
 def sample_discrete_feature_noise(limit_dist, node_mask):
     """Sample from the limit distribution of the diffusion process"""
 

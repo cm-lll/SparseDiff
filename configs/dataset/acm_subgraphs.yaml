@@ -1,0 +1,10 @@
+name: 'acm_subgraphs'
+datadir: 'data/ACM_subgraphs'
+remove_h: null
+molecules: False
+spectre: True
+pin_memory: False
+directed: True
+diffuse: 'subtype'   # 'type' (default codebase) | 'subtype' (ACM subgraph setting)
+heterogeneous: True  # True: 异质图（类别隔离空间，每条边在自己的关系族空间内扩散）
+                     # False: 同质图（全局空间，所有边共享一个扩散空间）

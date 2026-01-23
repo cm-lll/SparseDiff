@@ -1,8 +1,8 @@
 # General settings
 name: 'graph-tf-model'      # Warning: 'debug' and 'test' are reserved name that have a special behavior
 
-wandb: 'online'             # online | offline | disabled
-gpus: 1                     # Multi-gpu is not implemented on this branch
+wandb: 'online'             # online | offline | disabled (uses proxy from environment if available)
+gpus: 8                     # Number of GPUs to use (8x RTX 2080)
 
 resume: null            # If resume, path to ckpt file from outputs directory in main directory
 test_only: null         # Use absolute path

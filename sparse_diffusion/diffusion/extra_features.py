@@ -20,23 +20,55 @@ def batch_diagonal(X):
 class DummyExtraFeatures:
     """This class does not compute anything, just returns empty tensors."""
     def __call__(self, noisy_data, sparse=True):
-        X = noisy_data["node_t"]
-        if "comp_edge_attr_t" not in noisy_data:
-            E = noisy_data["edge_attr_t"]
-        else:
-            E = noisy_data["comp_edge_attr_t"]
-
-        y = noisy_data["y_t"]
-        empty_x = X.new_zeros((*X.shape[:-1], 0))
-        empty_e = E.new_zeros((*E.shape[:-1], 0))
-        empty_y = y.new_zeros((y.shape[0], 0))
-
-        if sparse:
-            return utils.SparsePlaceHolder(
-                node=empty_x, edge_index=None, edge_attr=empty_e, y=empty_y
+        # compute_extra_data 期望返回 PlaceHolder（密集格式），即使输入是稀疏的
+        # 所以我们需要将稀疏数据转换为密集格式
+        
+        if "X_t" in noisy_data:
+            # 已经是密集格式
+            X = noisy_data["X_t"]  # (bs, n, dx) 或 (N, dx)
+            E = noisy_data["E_t"]  # (bs, n, n, de) 或 (bs, n, n) 或其他
+            y = noisy_data["y_t"]  # (bs, dy)
+            
+            # 处理X：确保是 (bs, n, dx) 格式
+            if X.dim() == 2:  # (N, dx) - 需要reshape
+                # 需要从batch信息推断bs和n
+                if "batch" in noisy_data:
+                    batch = noisy_data["batch"]
+                    bs = batch.max().item() + 1
+                    n = X.shape[0] // bs
+                    X = X.reshape(bs, n, -1)
+                else:
+                    # 假设是单个图
+                    X = X.unsqueeze(0)  # (1, n, dx)
+            
+            # 处理E：确保是 (bs, n, n, de) 格式
+            if E.dim() == 3:  # (bs, n, n) - 需要添加de维度
+                E = E.unsqueeze(-1)  # (bs, n, n, 1)
+            elif E.dim() == 2:  # (n, n) - 需要添加bs和de维度
+                E = E.unsqueeze(0).unsqueeze(-1)  # (1, n, n, 1)
+            
+            empty_x = X.new_zeros((*X.shape[:-1], 0))  # (bs, n, 0)
+            empty_e = E.new_zeros((*E.shape[:-1], 0))  # (bs, n, n, 0)
+            empty_y = y.new_zeros((y.shape[0], 0))  # (bs, 0)
+            return utils.PlaceHolder(
+                X=empty_x, E=empty_e, y=empty_y
             ), 0., 0.
         else:
-            empty_e = E.new_zeros((*E.shape[:-1], 0, 0))
+            # 稀疏格式，需要转换为密集格式
+            # 使用 densify_noisy_data 来转换
+            dense_noisy_data = utils.densify_noisy_data(noisy_data)
+            X = dense_noisy_data["X_t"]  # (bs, n, dx)
+            E = dense_noisy_data["E_t"]  # (bs, n, n, de)
+            y = dense_noisy_data["y_t"]  # (bs, dy)
+            
+            # 确保E是4维的 (bs, n, n, de)
+            if E.dim() == 3:
+                # 如果E是 (bs, n, n)，需要添加de维度
+                E = E.unsqueeze(-1)  # (bs, n, n, 1)
+            
+            empty_x = X.new_zeros((*X.shape[:-1], 0))  # (bs, n, 0)
+            empty_e = E.new_zeros((*E.shape[:-1], 0))  # (bs, n, n, 0)
+            empty_y = y.new_zeros((y.shape[0], 0))  # (bs, 0)
             return utils.PlaceHolder(
                 X=empty_x, E=empty_e, y=empty_y
             ), 0., 0.
@@ -49,11 +81,29 @@ class ExtraFeatures:
         self.max_n_nodes = dataset_info.max_n_nodes
         self.edge_features = edge_features_type
         self.use_positional = use_positional
+        
+        # 检查是否为异质图
+        self.heterogeneous = getattr(dataset_info, "heterogeneous", False)
+        
         if use_positional:
             self.positional_encoding = PositionalEncoding(dataset_info.max_n_nodes)
         self.adj_features = AdjacencyFeatures(edge_features_type, num_degree=num_degree, dist_feat=dist_feat)
+        
+        # 对于异质图，使用专门设计的 HeterogeneousGraphFeatures
+        # 对于同质图，使用 EigenFeatures
         if eigenfeatures:
-            self.eigenfeatures = EigenFeatures(num_eigenvectors=num_eigenvectors, num_eigenvalues=num_eigenvalues)
+            if self.heterogeneous:
+                # 异质图使用专门的特征计算类
+                self.eigenfeatures = HeterogeneousGraphFeatures(
+                    dataset_info=dataset_info,
+                    num_eigenvectors=num_eigenvectors,
+                    num_eigenvalues=num_eigenvalues
+                )
+            else:
+                # 同质图使用原始的特征值特征
+                self.eigenfeatures = EigenFeatures(num_eigenvectors=num_eigenvectors, num_eigenvalues=num_eigenvalues)
+        else:
+            self.eigenfeatures = False
 
     def __call__(self, sparse_noisy_data):
         # make data dense in the beginning to avoid doing this twice for both cycles and eigenvalues
@@ -71,10 +121,35 @@ class ExtraFeatures:
 
         if self.eigenfeatures:
             start_time = time.time()
-            eval_feat, evec_feat = self.eigenfeatures.compute_features(noisy_data)
-            eigen_time = round(time.time() - start_time, 2)
-            x_feat = torch.cat((x_feat, evec_feat), dim=-1)
-            y_feat = torch.hstack((y_feat, eval_feat))
+            try:
+                eval_feat, evec_feat = self.eigenfeatures.compute_features(noisy_data)
+                eigen_time = round(time.time() - start_time, 2)
+                x_feat = torch.cat((x_feat, evec_feat), dim=-1)
+                y_feat = torch.hstack((y_feat, eval_feat))
+            except Exception as e:
+                # 对于异质图，特征值计算可能失败（数值稳定性问题）
+                # 如果失败，使用零特征
+                if self.heterogeneous:
+                    print(f"Warning: EigenFeatures computation failed for heterogeneous graph: {e}")
+                    print("Using zero features instead. Consider setting eigenfeatures=False for heterogeneous graphs.")
+                else:
+                    raise e
+                eigen_time = round(time.time() - start_time, 2)
+                bs = noisy_data["node_mask"].shape[0]
+                n_nodes = noisy_data["node_mask"].shape[1]
+                # 获取正确的特征维度
+                num_eigenvectors = self.eigenfeatures.num_eigenvectors
+                num_eigenvalues = self.eigenfeatures.num_eigenvalues
+                
+                # 创建零特征，维度需要匹配 eigenvector_features 的输出
+                # eigenvector_features 返回 (bs, n, num_eigenvectors + 1)
+                # 其中 +1 是 not_lcc_indicator
+                evec_feat = torch.zeros(bs, n_nodes, num_eigenvectors + 1, device=noisy_data["node_mask"].device)
+                # eigenvalues_features 返回 (n_connected_comp, batch_eigenvalues)
+                # n_connected_comp 是 (bs, 1)，batch_eigenvalues 是 (bs, num_eigenvalues)
+                eval_feat = torch.zeros(bs, 1 + num_eigenvalues, device=noisy_data["node_mask"].device)
+                x_feat = torch.cat((x_feat, evec_feat), dim=-1)
+                y_feat = torch.hstack((y_feat, eval_feat))
 
         return utils.PlaceHolder(X=x_feat, E=edge_feat, y=y_feat), cycle_time, eigen_time
 
@@ -98,6 +173,196 @@ class PositionalEncoding:
         extra_x = encoding.unsqueeze(0)                                         # 1, N, D
         extra_x = extra_x * dense_noisy_data['node_mask'].unsqueeze(-1)             # B, N, D
         return extra_x
+
+class HeterogeneousGraphFeatures:
+    """
+    为异质图设计的图特征，替代 EigenFeatures。
+    保留异质信息，为每种关系类型分别计算特征。
+    """
+    def __init__(self, dataset_info, num_eigenvectors, num_eigenvalues):
+        self.num_eigenvectors = num_eigenvectors
+        self.num_eigenvalues = num_eigenvalues
+        self.dataset_info = dataset_info
+        
+        # 获取异质图信息
+        self.edge_family_offsets = getattr(dataset_info, "edge_family_offsets", {})
+        self.edge_family2id = getattr(dataset_info, "edge_family2id", {})
+        self.id2edge_family = {v: k for k, v in self.edge_family2id.items()} if self.edge_family2id else {}
+        self.num_node_types = getattr(dataset_info, "num_node_types", 1)
+        
+    def compute_features(self, noisy_data):
+        """
+        为异质图计算特征。
+        
+        Returns:
+            evalue_feat: (bs, num_eigenvalues + 1) - 图级别的特征值特征（使用关系类型特定的统计）
+            evector_feat: (bs, n, num_eigenvectors) - 节点级别的特征向量特征（使用关系类型特定的度特征）
+        """
+        E_t = noisy_data["E_t"]  # (bs, n, n, de)
+        mask = noisy_data["node_mask"]  # (bs, n)
+        bs, n = mask.shape
+        
+        # 计算关系类型特定的特征
+        # 1. 为每种关系类型计算度特征（替代特征向量）
+        evector_feat = self._compute_relation_type_degree_features(E_t, mask)  # (bs, n, num_eigenvectors)
+        
+        # 2. 计算关系类型分布特征（替代特征值）
+        evalue_feat = self._compute_relation_type_statistics(E_t, mask)  # (bs, num_eigenvalues + 1)
+        
+        return evalue_feat, evector_feat
+    
+    def _compute_relation_type_degree_features(self, E_t, mask):
+        """
+        为每种关系类型计算节点的度特征。
+        
+        Args:
+            E_t: (bs, n, n, de) - 边属性（one-hot编码）
+            mask: (bs, n) - 节点掩码
+            
+        Returns:
+            features: (bs, n, num_eigenvectors) - 节点级别的特征
+        """
+        bs, n, _, de = E_t.shape
+        device = E_t.device
+        
+        # 获取所有关系族的offset
+        edge_family_offsets = self.edge_family_offsets
+        if not edge_family_offsets:
+            # 如果没有关系族信息，使用全局度特征
+            A = E_t[..., 1:].sum(dim=-1).float()  # (bs, n, n)
+            degree = A.sum(dim=-1)  # (bs, n)
+            # 归一化并扩展到 num_eigenvectors 维
+            degree = degree / (degree.sum(dim=-1, keepdim=True) + 1e-8)
+            # 使用不同的幂次来创建多个特征
+            features = []
+            for i in range(self.num_eigenvectors):
+                features.append(degree.unsqueeze(-1))
+            return torch.cat(features, dim=-1)  # (bs, n, num_eigenvectors)
+        
+        # 为每种关系类型计算度特征
+        features_list = []
+        
+        # 计算每种关系类型的度
+        for fam_name, offset in edge_family_offsets.items():
+            # 找到该关系族的范围
+            next_offset = de
+            for other_fam_name, other_offset in edge_family_offsets.items():
+                if other_offset > offset and other_offset < next_offset:
+                    next_offset = other_offset
+            
+            # 确保索引在有效范围内
+            offset = max(0, min(offset, de))
+            next_offset = max(offset + 1, min(next_offset, de))
+            
+            # 提取该关系族的边
+            fam_E_t = E_t[..., offset:next_offset]  # (bs, n, n, num_fam_states)
+            fam_A = fam_E_t.sum(dim=-1).float()  # (bs, n, n) - 该关系族的邻接矩阵
+            
+            # 计算入度和出度
+            in_degree = fam_A.sum(dim=1)  # (bs, n) - 入度
+            out_degree = fam_A.sum(dim=2)  # (bs, n) - 出度
+            total_degree = in_degree + out_degree  # (bs, n)
+            
+            # 归一化
+            total_degree = total_degree / (total_degree.sum(dim=-1, keepdim=True) + 1e-8)
+            in_degree = in_degree / (in_degree.sum(dim=-1, keepdim=True) + 1e-8)
+            out_degree = out_degree / (out_degree.sum(dim=-1, keepdim=True) + 1e-8)
+            
+            features_list.extend([total_degree.unsqueeze(-1), in_degree.unsqueeze(-1), out_degree.unsqueeze(-1)])
+        
+        # 如果特征数量不够，用全局度特征填充
+        all_features = torch.cat(features_list, dim=-1)  # (bs, n, num_fam_features)
+        if all_features.shape[-1] < self.num_eigenvectors:
+            # 使用全局度特征填充
+            A_global = E_t[..., 1:].sum(dim=-1).float()
+            degree_global = A_global.sum(dim=-1)
+            degree_global = degree_global / (degree_global.sum(dim=-1, keepdim=True) + 1e-8)
+            padding = self.num_eigenvectors - all_features.shape[-1]
+            for _ in range(padding):
+                all_features = torch.cat([all_features, degree_global.unsqueeze(-1)], dim=-1)
+        elif all_features.shape[-1] > self.num_eigenvectors:
+            # 截断到 num_eigenvectors
+            all_features = all_features[..., :self.num_eigenvectors]
+        
+        # 应用节点掩码
+        all_features = all_features * mask.unsqueeze(-1)
+        
+        return all_features  # (bs, n, num_eigenvectors)
+    
+    def _compute_relation_type_statistics(self, E_t, mask):
+        """
+        计算关系类型分布统计特征（替代特征值）。
+        
+        Args:
+            E_t: (bs, n, n, de) - 边属性
+            mask: (bs, n) - 节点掩码
+            
+        Returns:
+            features: (bs, num_eigenvalues + 1) - 图级别的特征
+        """
+        bs, n, _, de = E_t.shape
+        device = E_t.device
+        
+        # 计算图的连通分量数量（使用全局邻接矩阵）
+        A_global = E_t[..., 1:].sum(dim=-1).float()  # (bs, n, n)
+        A_global = A_global * mask.unsqueeze(1) * mask.unsqueeze(2)
+        
+        # 简单的连通分量估计：使用度分布
+        degree = A_global.sum(dim=-1)  # (bs, n)
+        num_connected_components = (degree == 0).sum(dim=-1).float()  # 孤立节点数量作为连通分量数量的下界
+        num_connected_components = num_connected_components.unsqueeze(-1)  # (bs, 1)
+        
+        # 计算每种关系类型的统计特征
+        edge_family_offsets = self.edge_family_offsets
+        if not edge_family_offsets:
+            # 如果没有关系族信息，使用全局统计
+            edge_dist = E_t[..., 1:].sum(dim=[1, 2])  # (bs, de-1)
+            edge_dist = edge_dist / (edge_dist.sum(dim=-1, keepdim=True) + 1e-8)
+            # 取前 num_eigenvalues 个值
+            if edge_dist.shape[-1] >= self.num_eigenvalues:
+                edge_dist = edge_dist[..., :self.num_eigenvalues]
+            else:
+                padding = self.num_eigenvalues - edge_dist.shape[-1]
+                edge_dist = torch.cat([edge_dist, torch.zeros(bs, padding, device=device)], dim=-1)
+            return torch.cat([num_connected_components, edge_dist], dim=-1)  # (bs, num_eigenvalues + 1)
+        
+        # 为每种关系类型计算统计特征
+        stats_list = []
+        
+        for fam_name, offset in edge_family_offsets.items():
+            # 找到该关系族的范围
+            next_offset = de
+            for other_fam_name, other_offset in edge_family_offsets.items():
+                if other_offset > offset and other_offset < next_offset:
+                    next_offset = other_offset
+            
+            # 确保索引在有效范围内
+            offset = max(0, min(offset, de))
+            next_offset = max(offset + 1, min(next_offset, de))
+            
+            # 提取该关系族的边
+            fam_E_t = E_t[..., offset:next_offset]  # (bs, n, n, num_fam_states)
+            fam_A = fam_E_t.sum(dim=-1).float()  # (bs, n, n)
+            
+            # 计算该关系类型的统计特征
+            num_edges = fam_A.sum(dim=[1, 2])  # (bs) - 该关系类型的边数量
+            avg_degree = (fam_A.sum(dim=-1).sum(dim=-1) / (mask.sum(dim=-1) + 1e-8))  # (bs) - 平均度
+            
+            stats_list.extend([num_edges.unsqueeze(-1), avg_degree.unsqueeze(-1)])
+        
+        # 组合所有统计特征
+        all_stats = torch.cat(stats_list, dim=-1)  # (bs, num_fam_stats)
+        
+        # 如果统计特征数量不够，用零填充
+        if all_stats.shape[-1] < self.num_eigenvalues:
+            padding = self.num_eigenvalues - all_stats.shape[-1]
+            all_stats = torch.cat([all_stats, torch.zeros(bs, padding, device=device)], dim=-1)
+        elif all_stats.shape[-1] > self.num_eigenvalues:
+            # 截断到 num_eigenvalues
+            all_stats = all_stats[..., :self.num_eigenvalues]
+        
+        return torch.cat([num_connected_components, all_stats], dim=-1)  # (bs, num_eigenvalues + 1)
+
 
 class EigenFeatures:
     """  Some code is taken from : https://github.com/Saro00/DGN/blob/master/models/pytorch/eigen_agg.py. """
