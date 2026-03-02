@@ -9,7 +9,7 @@ scaling_layer: False
 
 extra_features: 'all'        # 'all', 'cycles', or null
 eigenfeatures: True
-edge_features: 'all'          # 'all', 'dist', 'localngbs' or null
+edge_features: 'all'          # 两者都有或者路径特征（path / 距离）和局部邻居特征（local neighbors）二选一。'all', 'dist', 'localngbs' or null
 num_eigenvectors: 8       # eigenvectors
 num_eigenvalues: 5      # eigenvalues
 use_charge: False
@@ -24,9 +24,18 @@ sn_hidden_dim: 32
 # sparse generation settings
 edge_fraction: 0.5
 autoregressive: False
+# 边采样：True=先采样存在性再采样子类型（与分层损失一致，避免 no-edge 单类 > 有边总和时仍被选）；异质图默认 True
+hierarchical_edge_sampling: True
+
+# 异质图节点嵌入调制方式（边关系预测以子类别为基底）
+# use_type_modulation: True  -> Q = (1 + γ_Q(T)) ⊙ W^Q_t X + β_Q(T)，类别调制子类别
+# use_type_modulation: False -> Q = W^Q_t X，纯子类别基底，无类别调制
+# 两种方案可对比实验以提升边关系准确率
+use_type_modulation: True
 
 
 # The dimensions should satisfy dx % n_head == 0
-hidden_dims : {'dx': 256, 'de': 64, 'dy': 64, 'n_head': 8, 'dim_ffX': 256, 'dim_ffE': 128, 'dim_ffy': 128}
-
-lambda_train: [5, 0, 2]              # X=1, E = lambda[0], y = lambda[1]
+hidden_dims : {'dx': 256, 'de': 64, 'dy': 64, 'n_head': 8, 'dim_ffX': 512, 'dim_ffE': 128, 'dim_ffy': 128}
+# dim_ffX	节点分支里 FFN 的中间维。
+lambda_train: [5, 0, 2] # 这是训练总损失里各项的权重（节点损失固定为 1，不写进列表）, E = lambda[0], y = lambda[1]
+# loss = loss_X + lambda_train[0]*loss_E + lambda_train[1]*loss_y + lambda_train[2]*loss_charge

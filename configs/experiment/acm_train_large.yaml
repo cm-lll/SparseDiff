@@ -1,0 +1,35 @@
+# @package _global_
+# 相对大型的 ACM 异质图训练与测试（参考 2026-02-03 acm_train，放大规模）
+# 参考：outputs/2026-02-03/11-56-19-acm_train/.hydra/config.yaml
+defaults:
+  - override /dataset: acm_subgraphs
+general:
+  name: acm_train_large
+  sparse: True
+  gpus: 4
+  wandb: 'online'
+  check_val_every_n_epochs: 5
+  enable_val_sampling: true   # 验证阶段做采样，便于观察生成质量
+  enable_test_sampling: true  # 测试阶段做采样并算生成图指标
+  sample_every_val: 5
+  samples_to_generate: 50     # 每次验证采样生成图数（比 acm_train 的 10 多）
+  samples_to_save: 20
+  chains_to_save: 2
+  remove_h: True
+  number_chain_steps: 20
+  sample_num_nodes: null
+  final_model_samples_to_generate: 200  # 训练结束后最终采样数量（用于正式评估）
+  final_model_samples_to_save: 50
+  final_model_chains_to_save: 2
+train:
+  batch_size: 16              # 比 acm_train(4) 大，加快训练
+  save_model: True
+  n_epochs: 300               # 比 acm_train(100) 多，更充分训练
+  num_workers: 16
+model:
+  n_layers: 5                 # 比 acm_train(4) 多一层
+  diffusion_noise_schedule: 'cosine'
+  diffusion_steps: 200        # 比 acm_train(100) 多，扩散更细
+  hidden_mlp_dims: { 'X': 256, 'E': 128, 'y': 128 }
+  hidden_dims: {'dx': 256, 'de': 64, 'dy': 64, 'n_head': 8, 'dim_ffX': 512, 'dim_ffE': 128, 'dim_ffy': 128}
+  extra_features: 'all'

@@ -4,25 +4,27 @@ name: 'graph-tf-model'      # Warning: 'debug' and 'test' are reserved name that
 wandb: 'online'             # online | offline | disabled (uses proxy from environment if available)
 gpus: 8                     # Number of GPUs to use (8x RTX 2080)
 
-resume: null            # If resume, path to ckpt file from outputs directory in main directory
-test_only: null         # Use absolute path
-test_variance: 1
+resume: null            # 从 checkpoint 恢复训练 If resume, path to ckpt file from outputs directory in main directory
+test_only: null         # 只做测试、不训练 Use absolute path
+test_variance: 1        # 测试时重复采样次数
 generated_path: null    # path of generated samples, this file should be of pickle type
 
-check_val_every_n_epochs: 5
-sample_every_val: 4
-val_check_interval: null
-samples_to_generate: 512       # We advise to set it to 2 x batch_size maximum
-samples_to_save: 20
-chains_to_save: 1
-log_every_steps: 50
-number_chain_steps: 50        # Number of frames in each gif
+check_val_every_n_epochs: 5  # 每 N 个 epoch 做一次验证
+enable_val_sampling: false  # 是否在验证时做采样生成图；false 则只做预测指标（不跑采样）
+enable_test_sampling: false  # 是否在测试时做采样生成图；false 则测试阶段不跑采样、不算生成图指标
+sample_every_val: 4  # 每 N 个 epoch 采样一次（仅当 enable_val_sampling 为 true 时有效）
+val_check_interval: null  # 按步数做验证的间隔 Trainer(val_check_interval=...)；若设成小数（如 0.25）表示按训练进度比例；null 表示只用 check_val_every_n_epoch。
+samples_to_generate: 512  # 验证阶段采样时，一次生成多少张图（用于看训练过程中的生成质量） We advise to set it to 2 x batch_size maximum
+samples_to_save: 20  # 上述生成的图中，保存到本地/可视化/Wandb 的数量（例如只保存前 20 张）。
+chains_to_save: 1  # 保存多少条“从噪声到图”的完整链（常做成 gif 或视频），用于观察去噪过程。
+log_every_steps: 50  # 每 N 个 step 打印一次日志
+number_chain_steps: 50  # Number of frames in each gif
 
-final_model_samples_to_generate: 10000
-final_model_samples_to_save: 30
-final_model_chains_to_save: 20
+final_model_samples_to_generate: 10  # 训练结束后最终采样生成的图数量	训练
+final_model_samples_to_save: 10  # 最终采样中保存的图数量
+final_model_chains_to_save: 1  # 最终采样时保存的 chain 数量
 
-evaluate_all_checkpoints: False
+evaluate_all_checkpoints: False  # 是否评估目录下所有 checkpoint，仅在 test_only 非空时有效：以 test_only 所在目录为 ckpt 目录，对该目录下所有 .ckpt 文件依次跑 trainer.test(..., ckpt_path=...)，用于批量评估。
 
 # sampling skip
 skip: 1

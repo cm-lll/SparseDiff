@@ -15,7 +15,8 @@ class TrainAbstractMetricsDiscrete(torch.nn.Module):
     def reset(self):
         pass
 
-    def log_epoch_metrics(self):
+    def log_epoch_metrics(self, log_step=None):
+        """log_step: 可选，用于 wandb 横轴按 epoch 显示；基类忽略。"""
         return 0, 0
 
 
@@ -129,6 +130,32 @@ class CrossEntropyMetric(Metric):
 
     def compute(self):
         return self.total_ce / self.total_samples
+
+
+class MaskedAccuracy(Metric):
+    def __init__(self, ignore_index=0):
+        super().__init__()
+        self.ignore_index = ignore_index
+        self.add_state("correct", default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state("total", default=torch.tensor(0.0), dist_reduce_fx="sum")
+
+    def update(self, preds: Tensor, target: Tensor) -> None:
+        if preds.numel() == 0 or target.numel() == 0:
+            return
+
+        if target.dim() > 1:
+            target = target.argmax(dim=-1)
+
+        pred_labels = preds.argmax(dim=-1)
+        mask = target != self.ignore_index
+        if mask.any():
+            self.correct += (pred_labels[mask] == target[mask]).sum()
+            self.total += mask.sum()
+
+    def compute(self):
+        if self.total == 0:
+            return torch.tensor(-1.0, device=self.correct.device)
+        return self.correct / self.total
 
 
 class ProbabilityMetric(Metric):

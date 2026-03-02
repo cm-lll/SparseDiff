@@ -69,6 +69,8 @@ def get_computational_graph(
     clean_edge_index,
     clean_edge_attr,
     triu=True,
+    heterogeneous=False,
+    for_message_passing=True,
 ):
     """
     concat and remove repeated edges of query_edge_index and clean_edge_index
@@ -76,8 +78,31 @@ def get_computational_graph(
     in case where query_edge_attr is None, return query_edge_attr as 0
     else, return query_edge_attr for all query_edge_index
     (used in apply noise, when we need to sample the query edge attr)
+    
+    :param heterogeneous: 是否为异质图
+    :param for_message_passing: 是否用于消息传递。True时，即使是有向边也会添加反向边以支持双向信息流通；
+                                False时（采样阶段），保持有向边结构
     """
     # get dimension information
+    # 确保 clean_edge_attr 是2维的 (E, de)
+    if clean_edge_attr.dim() > 2:
+        # 如果是3维或更高维，压缩多余的维度
+        clean_edge_attr = clean_edge_attr.squeeze()
+    if clean_edge_attr.dim() == 1:
+        # 如果是1维，需要扩展为2维
+        clean_edge_attr = clean_edge_attr.unsqueeze(-1)
+    
+    # 为消息传递双向：确保 clean 含 (u,v) 与 (v,u)，使有向边两端都能收到对方信息
+    # （例如：作者发了哪些论文、论文有哪些作者，在 MP 时双方都应聚合到对方的信息）
+    # 若 clean 已是无向，to_undirected 产生的重复 (row,col) 会由后续 coalesce 合并
+    # 异质图：在消息传递时需要双向信息流通，但在采样时保持有向边结构
+    if clean_edge_index.shape[1] > 0:
+        if not heterogeneous or for_message_passing:
+            # 同质图：总是使用to_undirected
+            # 异质图：仅在消息传递时使用to_undirected（支持双向信息流通）
+            clean_edge_index, clean_edge_attr = utils.to_undirected(clean_edge_index, clean_edge_attr)
+        # 异质图且非消息传递（采样阶段）：保持有向边结构，不转换
+    
     de = clean_edge_attr.shape[-1]
     device = triu_query_edge_index.device
 
@@ -88,19 +113,28 @@ def get_computational_graph(
     default_query_edge_attr[:, 0] = 1
 
     # if query_edge_attr is None, use default query edge attr
+    # 异质图：在消息传递时需要双向信息流通，但在采样时保持有向边结构
     if triu:
-        # make random edges symmetrical
-        query_edge_index, default_query_edge_attr = utils.to_undirected(
-            triu_query_edge_index, default_query_edge_attr
-        )
-        _, default_query_edge_attr = utils.to_undirected(
-            triu_query_edge_index, default_query_edge_attr
-        )
+        if not heterogeneous or for_message_passing:
+            # 同质图：总是使用to_undirected
+            # 异质图：仅在消息传递时使用to_undirected（支持双向信息流通）
+            query_edge_index, default_query_edge_attr = utils.to_undirected(
+                triu_query_edge_index, default_query_edge_attr
+            )
+        else:
+            # 异质图且非消息传递（采样阶段）：保持有向边结构
+            query_edge_index, default_query_edge_attr = triu_query_edge_index, default_query_edge_attr
     else:
         query_edge_index, default_query_edge_attr = triu_query_edge_index, default_query_edge_attr
 
     # get the computational graph: positive edges + random edges
     comp_edge_index = torch.hstack([clean_edge_index, query_edge_index])
+    # 确保两个张量都是2维的
+    if clean_edge_attr.dim() != 2:
+        clean_edge_attr = clean_edge_attr.view(-1, de)
+    if default_query_edge_attr.dim() != 2:
+        default_query_edge_attr = default_query_edge_attr.view(-1, de)
+    
     default_comp_edge_attr = torch.argmax(
         torch.vstack([clean_edge_attr, default_query_edge_attr]), -1
     )
@@ -130,9 +164,16 @@ def check_symmetry(edge_index):
 
 
 def mask_query_graph_from_comp_graph(
-    triu_query_edge_index, edge_index, edge_attr, num_classes
+    triu_query_edge_index, edge_index, edge_attr, num_classes, heterogeneous=False, for_message_passing=True
 ):
-    query_edge_index = utils.to_undirected(triu_query_edge_index)
+    # 异质图：在消息传递时需要双向信息流通，但在采样时保持有向边结构
+    if heterogeneous and not for_message_passing:
+        # 异质图且非消息传递（采样阶段）：保持有向边结构
+        query_edge_index = triu_query_edge_index
+    else:
+        # 同质图：总是使用to_undirected
+        # 异质图且消息传递：使用to_undirected支持双向信息流通
+        query_edge_index = utils.to_undirected(triu_query_edge_index)
     # import pdb; pdb.set_trace()
 
     all_edge_index = torch.hstack([edge_index, query_edge_index])

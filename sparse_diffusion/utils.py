@@ -76,12 +76,86 @@ def to_dense_edge(edge_index, edge_attr, batch, max_num_nodes):
     edge_index, edge_attr = torch_geometric.utils.remove_self_loops(
         edge_index, edge_attr
     )
+    # Fast-path: no edges (or empty edge_attr) -> return dense all-zero adjacency (4D) and let
+    # encode_no_edge() set the "no-edge" channel properly.
+    if edge_index.numel() == 0 or edge_attr is None or edge_attr.numel() == 0:
+        device = batch.device if (batch is not None) else (edge_attr.device if edge_attr is not None else torch.device("cpu"))
+        bs = int(batch.max().item()) + 1 if (batch is not None and batch.numel() > 0) else 1
+
+        if edge_attr is None:
+            de_flat = 0
+        else:
+            # edge_attr can be (0,), (0, de), or (0, de1, de2, ...). Flatten feature dims deterministically.
+            if edge_attr.dim() >= 2:
+                de_flat = int(np.prod(edge_attr.shape[1:])) if len(edge_attr.shape[1:]) > 0 else 0
+            elif edge_attr.dim() == 1:
+                de_flat = 1
+            else:
+                de_flat = 0
+
+        E = torch.zeros((bs, max_num_nodes, max_num_nodes, de_flat), device=device)
+        E = encode_no_edge(E)
+        return E
+    # 确保 edge_attr 是2维的 (E, de)
+    # 处理空张量的情况（虽然 fast-path 已经处理了，但为了安全还是检查）
+    if edge_attr.numel() == 0:
+        # 空张量，保持原样
+        pass
+    elif edge_attr.dim() > 2:
+        # 如果是3维或更高维，需要处理
+        # 如果 edge_attr 是 (E, de1, de2) 形状，可能需要reshape
+        # 但通常 one-hot 编码应该是 (E, de) 形状
+        # 尝试压缩所有大小为1的维度
+        edge_attr = edge_attr.squeeze()
+        # 如果压缩后仍然是多维的，取最后一个维度作为特征维度
+        if edge_attr.dim() > 2:
+            # 如果是 (E, de1, de2) 形状，可能需要reshape为 (E, de1*de2)
+            # 或者只取第一个特征维度
+            E_dim = edge_attr.shape[0]
+            # 尝试将所有特征维度展平（避免 E_dim==0 时 view(E_dim, -1) 的歧义）
+            if E_dim > 0:
+                flat_dim = int(np.prod(edge_attr.shape[1:])) if edge_attr.dim() > 1 else 0
+                edge_attr = edge_attr.view(E_dim, flat_dim)
+            # 如果 E_dim == 0，保持原样（空张量）
+    elif edge_attr.dim() == 1:
+        # 如果是1维，扩展为2维
+        edge_attr = edge_attr.unsqueeze(-1)
+    
     E = to_dense_adj(
         edge_index=edge_index,
         batch=batch,
         edge_attr=edge_attr,
         max_num_nodes=max_num_nodes,
     )
+    # 确保 E 是4维的 (bs, n, n, de)
+    # 处理 to_dense_adj 可能返回5维张量的情况
+    original_E_shape = E.shape
+    original_E_dim = E.dim()
+    
+    # 强制处理5维张量的情况 - 必须在 encode_no_edge 之前执行
+    if original_E_dim == 5:
+        # 如果是 (bs, n, n, de1, de2)，需要reshape为 (bs, n, n, de1*de2)
+        bs, n1, n2, de1, de2 = E.shape
+        E = E.contiguous().view(bs, n1, n2, de1 * de2)
+    elif original_E_dim > 5:
+        # 如果是更高维，尝试reshape
+        shape = E.shape
+        E = E.contiguous().view(shape[0], shape[1], shape[2], -1)
+    elif original_E_dim < 4:
+        # 如果维度小于4，可能需要扩展
+        while E.dim() < 4:
+            E = E.unsqueeze(-1)
+    
+    # 最终检查：确保 E 是4维的 - 如果仍然是5维，抛出详细错误
+    final_E_dim = E.dim()
+    if final_E_dim != 4:
+        raise ValueError(
+            f"E should be 4D tensor after processing, but got {E.shape} (dim={final_E_dim}). "
+            f"Original shape from to_dense_adj: {original_E_shape} (dim={original_E_dim}), "
+            f"edge_attr shape: {edge_attr.shape if edge_attr is not None else 'None'}. "
+            f"Fix logic was executed but failed to convert to 4D."
+        )
+    
     E = encode_no_edge(E)
     return E
 
@@ -358,14 +432,23 @@ class SparsePlaceHolder:
 
 
 def delete_repeated_twice_edges(edge_index, edge_attr):    
+    if edge_index.shape[1] == 0:
+        return edge_index, edge_attr
+    
     min_edge_index, min_edge_attr = coalesce(
             edge_index, edge_attr, reduce="min"
         )
     max_edge_index, max_edge_attr = coalesce(
             edge_index, edge_attr, reduce="max"
         )
-    rand_pos = torch.randint(0, 2, (len(edge_attr),))
-    max_edge_attr[rand_pos] = min_edge_attr[rand_pos]
+    
+    # 确保 rand_pos 的长度不超过 max_edge_attr 的长度
+    # rand_pos 是一个整数张量（0或1），用于选择哪些位置使用 min_edge_attr
+    num_edges = max_edge_attr.shape[0]
+    rand_pos = torch.randint(0, 2, (num_edges,), device=edge_attr.device, dtype=torch.long)
+    # 将 rand_pos 转换为布尔掩码：1 的位置使用 min_edge_attr，0 的位置保持 max_edge_attr
+    rand_mask = rand_pos.bool()
+    max_edge_attr[rand_mask] = min_edge_attr[rand_mask]
 
     return max_edge_index, max_edge_attr
 
@@ -647,7 +730,14 @@ def concat_sparse_graphs(graphs):
     """Concatenate several sparse placeholders into a single one."""
     graph = graphs[0]
     graph.node = torch.hstack([g.node for g in graphs])
-    graph.edge_attr = torch.hstack([g.edge_attr for g in graphs])
+    # 统一 edge_attr 维度：如果是 one-hot，转换为离散值
+    edge_attrs = []
+    for g in graphs:
+        ea = g.edge_attr
+        if ea.dim() > 1:
+            ea = ea.argmax(dim=-1)
+        edge_attrs.append(ea)
+    graph.edge_attr = torch.hstack(edge_attrs)
     graph.y = torch.vstack([g.y for g in graphs])
     num_node_ptr = [0] + [len(g.batch) for g in graphs]
     num_node_ptr = torch.tensor(num_node_ptr).cumsum(-1)

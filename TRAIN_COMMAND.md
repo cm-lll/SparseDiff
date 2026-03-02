@@ -1,5 +1,61 @@
 # 完整训练命令
 
+## 训练前释放 GPU（避免 OOM）
+
+若上次训练异常退出或后台进程未结束，GPU 显存可能未释放，新训练易 OOM。建议每次开训前：
+
+```bash
+# 1. 看谁在占 GPU
+nvidia-smi
+
+# 2. 若有残留的 python 进程（如 main.py），记下 PID 后结束，例如：
+# kill -9 <PID>
+
+# 3. 再次确认显存已空
+nvidia-smi
+```
+
+若在 Python 里跑（如 Jupyter），可在 import 后加一行清空当前进程的 CUDA 缓存：`torch.cuda.empty_cache()`。命令行重新起进程时一般不需要。
+
+## 重试前先清理资源
+
+每次说「再试一下」前，必须先结束上次训练占用的进程，否则会抢显存或卡住：
+
+```bash
+# 结束本项目的训练进程
+pkill -f "sparse_diffusion/main.py"
+pkill -f "run_acm_train.sh"
+sleep 2
+# 若 nvidia-smi 里仍有你的 python3（非 1266051），记下 PID 后：kill -9 <PID>
+nvidia-smi
+```
+
+确认显存无你的进程后，再执行下面的 ACM 训练。
+
+## ACM 四卡训练（+experiment=acm_train）
+
+**必须使用 GPU 1,2,3,4**（不要用 0），否则可能失败。两种方式任选其一：
+
+**方式一：用脚本（推荐）**
+
+```bash
+cd /data2/lyh/gnn_project/SparseDiff
+chmod +x run_acm_train.sh
+./run_acm_train.sh
+```
+
+脚本里已设置 `CUDA_VISIBLE_DEVICES=1,2,3,4`，并自动 `conda activate sparse`。
+
+**方式二：命令行手动指定**
+
+```bash
+cd /data2/lyh/gnn_project/SparseDiff
+conda activate sparse
+
+export CUDA_VISIBLE_DEVICES=1,2,3,4
+python3 sparse_diffusion/main.py +experiment=acm_train
+```
+
 ## 基础训练命令（单GPU，用于测试）
 
 ```bash
@@ -61,6 +117,44 @@ python3 sparse_diffusion/main.py \
   general.samples_to_generate=50 \
   train.save_model=True
 ```
+
+## 大型训练与测试（acm_train_large，参考 2026-02-03 acm_train）
+
+在 2026-02-03 的 `+experiment=acm_train` 基础上放大：更多 epoch、更大 batch、更多 diffusion 步数、更大模型、开启验证/测试采样并增加采样数量。
+
+**一键启动（四卡，GPU 1,2,3,4）：**
+
+```bash
+cd /data2/lyh/gnn_project/SparseDiff
+chmod +x run_acm_train_large.sh
+./run_acm_train_large.sh
+```
+
+**或手动指定：**
+
+```bash
+cd /data2/lyh/gnn_project/SparseDiff
+conda activate sparse
+export CUDA_VISIBLE_DEVICES=1,2,3,4
+python3 sparse_diffusion/main.py +experiment=acm_train_large
+```
+
+**与 2 月 3 日 acm_train 对比：**
+
+| 项 | 2026-02-03 acm_train | acm_train_large |
+|----|----------------------|------------------|
+| gpus | 4 | 4 |
+| n_epochs | 100 | 300 |
+| batch_size | 4 | 16 |
+| diffusion_steps | 100 | 200 |
+| n_layers | 4 | 5 |
+| hidden_dims (dx/dim_ffX) | 128/256 | 256/512 |
+| enable_val_sampling | false | true |
+| enable_test_sampling | false | true |
+| samples_to_generate | 10 | 50 |
+| final_model_samples_to_generate | 10 | 200 |
+
+训练结束后会自动在测试集上跑采样（`enable_test_sampling=true`），生成图与指标会写入当前 run 目录并同步到 wandb。
 
 ## 参数说明
 

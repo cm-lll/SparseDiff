@@ -10,6 +10,7 @@ general:
     chains_to_save: 1
     remove_h: True
     number_chain_steps: 10        # Number of frames in each gif
+    sample_num_nodes: null        # Number of nodes per graph during sampling (null = sample from training distribution, int = fixed number, list = per-graph numbers)
 train:
     batch_size: 4
     save_model: False

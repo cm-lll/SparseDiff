@@ -14,6 +14,7 @@ from omegaconf import DictConfig
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 
+import wandb
 import utils
 from metrics.abstract_metrics import TrainAbstractMetricsDiscrete
 from diffusion_model_sparse import DiscreteDenoisingDiffusion
@@ -185,10 +186,17 @@ def main(cfg: DictConfig):
         print("[WARNING]: Run is called 'debug' -- it will run with fast_dev_run. ")
 
     use_gpu = cfg.general.gpus > 0 and torch.cuda.is_available()
+    # 检查是否为异质图模式，如果是，需要启用find_unused_parameters（因为某些嵌入表可能在某些batch中未使用）
+    heterogeneous = getattr(dataset_infos, "heterogeneous", False)
+    if heterogeneous:
+        strategy = "ddp_find_unused_parameters_true"
+    else:
+        strategy = "ddp"
+    
+    enable_validation = getattr(cfg.general, "enable_validation", True)
     trainer = pl.Trainer(
         gradient_clip_val=cfg.train.clip_grad,
-        strategy="ddp",
-        # strategy="ddp_find_unused_parameters_true",
+        strategy=strategy,
         accelerator="gpu" if use_gpu else "cpu",
         devices=cfg.general.gpus if use_gpu else 1,
         val_check_interval=cfg.general.val_check_interval,
@@ -199,28 +207,47 @@ def main(cfg: DictConfig):
         log_every_n_steps=50 if name != "debug" else 1,
         enable_progress_bar=False,
         logger=[],
+        limit_val_batches=0.0 if not enable_validation else 1.0,
+        num_sanity_val_steps=0 if not enable_validation else 2,
     )
 
-    if not cfg.general.test_only and not cfg.general.generated_path:
-        trainer.fit(model, datamodule=datamodule, ckpt_path=cfg.general.resume)
-        if cfg.general.name != "debug":
-            trainer.test(model, datamodule=datamodule)
-    else:
-        # Start by evaluating test_only_path
-        pl.seed_everything(1000)
-        trainer.test(model, datamodule=datamodule, ckpt_path=cfg.general.test_only)
-        if cfg.general.evaluate_all_checkpoints:
-            directory = pathlib.Path(cfg.general.test_only).parents[0]
-            print("Directory:", directory)
-            files_list = os.listdir(directory)
-            for file in files_list:
-                if ".ckpt" in file:
-                    ckpt_path = os.path.join(directory, file)
-                    if ckpt_path == cfg.general.test_only:
-                        continue
-                    print("Loading checkpoint", ckpt_path)
-                    utils.setup_wandb(cfg)
-                    trainer.test(model, datamodule=datamodule, ckpt_path=ckpt_path)
+    try:
+        if not cfg.general.test_only and not cfg.general.generated_path:
+            trainer.fit(model, datamodule=datamodule, ckpt_path=cfg.general.resume)
+            if cfg.general.name != "debug":
+                trainer.test(model, datamodule=datamodule)
+        else:
+            # Start by evaluating test_only_path
+            pl.seed_everything(1000)
+            # 用 strict=False 加载，以兼容缺少新模块（如 edge_fusion）的旧 ckpt，便于复用已训练权重
+            ckpt_path = cfg.general.test_only
+            if ckpt_path and os.path.isfile(ckpt_path):
+                try:
+                    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+                except TypeError:
+                    ckpt = torch.load(ckpt_path, map_location="cpu")
+                if "state_dict" in ckpt:
+                    missing, unexp = model.load_state_dict(ckpt["state_dict"], strict=False)
+                    if missing or unexp:
+                        print("Loaded ckpt with strict=False; missing:", missing, "unexpected:", unexp)
+                trainer.test(model, datamodule=datamodule)
+            else:
+                trainer.test(model, datamodule=datamodule, ckpt_path=ckpt_path)
+            if cfg.general.evaluate_all_checkpoints:
+                directory = pathlib.Path(cfg.general.test_only).parents[0]
+                print("Directory:", directory)
+                files_list = os.listdir(directory)
+                for file in files_list:
+                    if ".ckpt" in file:
+                        ckpt_path = os.path.join(directory, file)
+                        if ckpt_path == cfg.general.test_only:
+                            continue
+                        print("Loading checkpoint", ckpt_path)
+                        utils.setup_wandb(cfg)
+                        trainer.test(model, datamodule=datamodule, ckpt_path=ckpt_path)
+    finally:
+        if wandb.run is not None:
+            wandb.finish()
 
 
 if __name__ == "__main__":

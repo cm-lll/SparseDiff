@@ -102,17 +102,22 @@ def sampled_condensed_indices_uniformly(
         len(torch.unique(max_condensed_value)) == 1
         and len(torch.unique(num_edges_to_sample)) == 1
     ):
-        max_val = max_condensed_value[0]
-        to_sample = num_edges_to_sample[0]
+        max_val = int(max_condensed_value[0].item())
+        to_sample = min(int(num_edges_to_sample[0].item()), max_val)
+        if to_sample <= 0 or max_val <= 0:
+            empty_c = torch.tensor([], device=device, dtype=torch.long)
+            empty_b = torch.zeros(0, device=device, dtype=torch.long)
+            if return_mask:
+                return empty_c, empty_b, empty_c
+            return empty_c, empty_b
+
         sampled_condensed = torch.multinomial(
             torch.ones(max_val, device=device), num_samples=to_sample, replacement=False
         )
-        edge_batch = torch.zeros(
-            num_edges_to_sample[0], device=device, dtype=torch.long
-        )
+        edge_batch = torch.zeros(to_sample, device=device, dtype=torch.long)
         if batch_size == 1:
             if return_mask:
-                condensed_mask = torch.arange(num_edges_to_sample[0], device=device)
+                condensed_mask = torch.arange(to_sample, device=device)
                 return sampled_condensed, edge_batch, condensed_mask
 
             return sampled_condensed, edge_batch
@@ -127,7 +132,7 @@ def sampled_condensed_indices_uniformly(
         )
 
         if return_mask:
-            condensed_mask = torch.arange(num_edges_to_sample[0], device=device)
+            condensed_mask = torch.arange(to_sample, device=device)
             condensed_mask = (
                 condensed_mask.unsqueeze(0).expand(batch_size, -1).flatten()
             )
@@ -264,7 +269,7 @@ def sample_non_existing_edges_batched_heterogeneous(
     offset = torch.cumsum(num_nodes, dim=0)[:-1]  # (bs - 1)
     offset = torch.cat((torch.zeros(1, device=device, dtype=torch.long), offset))  # (bs)
     
-    # For each batch, collect all possible edges (src_type -> dst_type) and existing edges
+    # For each batch, sample non-existing edges without materializing all pairs
     all_sampled_edges = []
     
     for b in range(bs):
@@ -280,8 +285,6 @@ def sample_non_existing_edges_batched_heterogeneous(
         local_src_nodes = batch_src_nodes - offset[b]
         local_dst_nodes = batch_dst_nodes - offset[b]
         
-        # Create all possible edges (src -> dst) as a cartesian product
-        # For directed graphs, we consider all src -> dst pairs
         num_src = len(local_src_nodes)
         num_dst = len(local_dst_nodes)
         
@@ -289,55 +292,79 @@ def sample_non_existing_edges_batched_heterogeneous(
             # No valid edges for this batch
             continue
         
-        # Create all possible edge pairs using vectorized operations
-        src_indices = local_src_nodes.unsqueeze(1).expand(-1, num_dst).flatten()  # (num_src * num_dst,)
-        dst_indices = local_dst_nodes.unsqueeze(0).expand(num_src, -1).flatten()  # (num_src * num_dst,)
-        
-        # Convert to global node indices
-        global_src_indices = src_indices + offset[b]
-        global_dst_indices = dst_indices + offset[b]
-        
-        # Create edge index for all possible edges
-        all_possible_edges = torch.stack([global_src_indices, global_dst_indices])  # (2, num_possible)
-        
         # Get existing edges for this batch
         existing_batch_mask = batch[existing_edge_index[0]] == b
         if existing_batch_mask.any():
             existing_edges_b = existing_edge_index[:, existing_batch_mask]  # (2, E_b)
         else:
             existing_edges_b = torch.empty((2, 0), dtype=torch.long, device=device)
-        
-        # Remove existing edges from all possible edges using vectorized operations
+
+        # Filter existing edges to src/dst masks for this family
         if existing_edges_b.shape[1] > 0:
-            # Use vectorized comparison to find non-existing edges
-            # Compare each possible edge with all existing edges
-            # Shape: (num_possible, E_b) for each dimension
-            src_match = (all_possible_edges[0:1, :].T == existing_edges_b[0:1, :])  # (num_possible, E_b)
-            dst_match = (all_possible_edges[1:2, :].T == existing_edges_b[1:2, :])  # (num_possible, E_b)
-            both_match = src_match & dst_match  # (num_possible, E_b)
-            is_existing = both_match.any(dim=1)  # (num_possible,)
-            
-            # Filter out existing edges
-            non_existing_mask = ~is_existing
-            non_existing_edges = all_possible_edges[:, non_existing_mask]
-        else:
-            non_existing_edges = all_possible_edges
-        
-        # Sample from non-existing edges
+            type_mask = src_mask[existing_edges_b[0]] & dst_mask[existing_edges_b[1]]
+            existing_edges_b = existing_edges_b[:, type_mask]
+
+        # Build hash set of existing edges (global ids) to avoid duplicates
+        batch_max_node = int((offset[b] + num_nodes[b]).item()) + 1
+        existing_hash = set()
+        if existing_edges_b.shape[1] > 0:
+            src_e = existing_edges_b[0].detach().cpu().tolist()
+            dst_e = existing_edges_b[1].detach().cpu().tolist()
+            for s, d in zip(src_e, dst_e):
+                existing_hash.add(s * batch_max_node + d)
+
+        # Avoid self-loops for same-type relations by marking them as existing
+        batch_src_nodes_cpu = batch_src_nodes.detach().cpu()
+        batch_dst_nodes_cpu = batch_dst_nodes.detach().cpu()
+        same_type = (
+            batch_src_nodes_cpu.numel() == batch_dst_nodes_cpu.numel()
+            and torch.equal(batch_src_nodes_cpu, batch_dst_nodes_cpu)
+        )
+        if same_type:
+            for n in batch_src_nodes_cpu.tolist():
+                existing_hash.add(n * batch_max_node + n)
+
+        # Sample from non-existing edges without materializing all pairs
         num_to_sample = int(num_edges_to_sample[b].item())
-        num_available = non_existing_edges.shape[1]
-        
+        if num_to_sample <= 0:
+            continue
+
+        num_possible = num_src * num_dst
+        num_available = max(num_possible - len(existing_hash), 0)
         if num_available == 0:
             continue
-        
         if num_to_sample > num_available:
-            # Sample all available edges
-            sampled_indices = torch.arange(num_available, device=device)
-        else:
-            # Randomly sample without replacement
-            sampled_indices = torch.randperm(num_available, device=device)[:num_to_sample]
-        
-        sampled_edges_b = non_existing_edges[:, sampled_indices]
+            num_to_sample = num_available
+
+        sampled_src = []
+        sampled_dst = []
+        sampled_hash = set()
+        tries = 0
+        max_tries = max(num_to_sample * 20, 1000)
+        while len(sampled_src) < num_to_sample and tries < max_tries:
+            remaining = num_to_sample - len(sampled_src)
+            batch_size = min(remaining * 10, 10000)
+            src_idx = torch.randint(0, num_src, (batch_size,), device="cpu")
+            dst_idx = torch.randint(0, num_dst, (batch_size,), device="cpu")
+            for i in range(batch_size):
+                s = int(batch_src_nodes_cpu[src_idx[i]].item())
+                d = int(batch_dst_nodes_cpu[dst_idx[i]].item())
+                h = s * batch_max_node + d
+                if h in existing_hash or h in sampled_hash:
+                    continue
+                sampled_hash.add(h)
+                sampled_src.append(s)
+                sampled_dst.append(d)
+                if len(sampled_src) >= num_to_sample:
+                    break
+            tries += batch_size
+
+        if len(sampled_src) == 0:
+            continue
+
+        sampled_edges_b = torch.tensor(
+            [sampled_src, sampled_dst], dtype=torch.long, device=device
+        )
         all_sampled_edges.append(sampled_edges_b)
     
     if len(all_sampled_edges) == 0:

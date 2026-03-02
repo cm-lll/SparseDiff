@@ -17,7 +17,7 @@ from torch_geometric.utils import subgraph
 
 def mol_to_torch_geometric(mol, atom_encoder, smiles):
     if Chem is None:  # pragma: no cover
-        raise ImportError(
+        raise ImportError( 
             "RDKit is required for molecular datasets, but it could not be imported. "
             f"Original error: {_RDKIT_IMPORT_ERROR}"
         )
@@ -86,13 +86,21 @@ def to_list(value: Any) -> Sequence:
 
 class Statistics:
     def __init__(
-        self, num_nodes, node_types, bond_types, charge_types=None, valencies=None
+        self, num_nodes, node_types, bond_types, charge_types=None, valencies=None,
+        node_subtype_by_type=None, edge_subtype_by_family=None,
+        node_type_distribution=None, edge_family_distribution=None
     ):
         self.num_nodes = num_nodes
-        self.node_types = node_types
-        self.bond_types = bond_types
+        self.node_types = node_types  # 全局子类别分布（所有14个子类别）
+        self.bond_types = bond_types  # 全局边类型分布（所有6个边类型）
         self.charge_types = charge_types
         self.valencies = valencies
+        # 异质图：按类型/关系族分组的子类别分布
+        self.node_subtype_by_type = node_subtype_by_type  # Dict[node_type_name, torch.Tensor] - 每个节点类型的子类别分布
+        self.edge_subtype_by_family = edge_subtype_by_family  # Dict[edge_family_name, torch.Tensor] - 每个关系族的边子类别分布
+        # 异质图：节点类型分布和关系族分布（用于初始化）
+        self.node_type_distribution = node_type_distribution  # Dict[node_type_name, float] - 每个节点类型的比例分布
+        self.edge_family_distribution = edge_family_distribution  # Dict[(src_type, dst_type), Dict[edge_family_name, float]] - 两个节点类型之间，每个关系族的比例分布
 
 
 class RemoveYTransform:

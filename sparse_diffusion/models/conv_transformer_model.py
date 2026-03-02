@@ -16,6 +16,7 @@ from torch_geometric.utils import softmax, sort_edge_index
 
 from sparse_diffusion import utils
 from sparse_diffusion.models.transconv_layer import TransformerConv
+from sparse_diffusion.models.heterogeneous_transconv_layer import HeterogeneousTransformerConv
 from sparse_diffusion.models.layers import SparseXtoy, SparseEtoy
 
 
@@ -44,21 +45,56 @@ class XEyTransformerLayer(nn.Module):
         layer_norm_eps: float = 1e-5,
         device=None,
         dtype=None,
+        # 异质图相关参数
+        heterogeneous: bool = False,
+        num_node_types: int = 0,
+        num_node_subtypes: int = 0,
+        num_relation_types: int = 0,
+        type_embed_dim: int = 64,
+        subtype_embed_dim: int = 64,
+        relation_embed_dim: int = 64,
+        edge_family_offsets: Optional[dict] = None,
+        use_type_modulation: bool = True,  # 是否使用类别调制子类别
     ) -> None:
         kw = {"device": device, "dtype": dtype}
         super().__init__()
 
         self.last_layer = last_layer
-        self.self_attn = TransformerConv(
-            dx=dx,
-            de=de,
-            dy=dy,
-            heads=n_head,
-            concat=True,
-            dropout=dropout,
-            bias=True,
-            last_layer=last_layer,
-        )
+        self.heterogeneous = heterogeneous
+        
+        if heterogeneous:
+            # 使用异质图Transformer层
+            self.self_attn = HeterogeneousTransformerConv(
+                dx=dx,
+                de=de,
+                dy=dy,
+                heads=n_head,
+                concat=True,
+                dropout=dropout,
+                bias=True,
+                last_layer=last_layer,
+                heterogeneous=True,
+                num_node_types=num_node_types,
+                num_node_subtypes=num_node_subtypes,
+                num_relation_types=num_relation_types,
+                type_embed_dim=type_embed_dim,
+                subtype_embed_dim=subtype_embed_dim,
+                relation_embed_dim=relation_embed_dim,
+                edge_family_offsets=edge_family_offsets,
+                use_type_modulation=use_type_modulation,
+            )
+        else:
+            # 使用原始Transformer层
+            self.self_attn = TransformerConv(
+                dx=dx,
+                de=de,
+                dy=dy,
+                heads=n_head,
+                concat=True,
+                dropout=dropout,
+                bias=True,
+                last_layer=last_layer,
+            )
 
         self.linX1 = Linear(dx, dim_ffX, **kw)
         self.linX2 = Linear(dim_ffX, dx, **kw)
@@ -79,7 +115,18 @@ class XEyTransformerLayer(nn.Module):
         self.activation = F.relu
 
     def forward(
-        self, X: Tensor, edge_index: Tensor, edge_attr: Tensor, y: Tensor, batch: Tensor
+        self, 
+        X: Tensor, 
+        edge_index: Tensor, 
+        edge_attr: Tensor, 
+        y: Tensor, 
+        batch: Tensor,
+        # 异质图元数据（可选）
+        node_type_ids: Optional[Tensor] = None,
+        node_subtype_ids: Optional[Tensor] = None,
+        relation_type_ids: Optional[Tensor] = None,
+        edge_family_ids: Optional[Tensor] = None,
+        type_offsets: Optional[dict] = None,
     ):
         """Pass the input through the encoder layer.
         X: (N, d)
@@ -88,7 +135,17 @@ class XEyTransformerLayer(nn.Module):
         batch: (n)
         y: (n)
         """
-        new_x, new_edge_attr, new_y = self.self_attn(X, edge_index, edge_attr, y, batch)
+        if self.heterogeneous:
+            new_x, new_edge_attr, new_y = self.self_attn(
+                X, edge_index, edge_attr, y, batch,
+                node_type_ids=node_type_ids,
+                node_subtype_ids=node_subtype_ids,
+                relation_type_ids=relation_type_ids,
+                edge_family_ids=edge_family_ids,
+                type_offsets=type_offsets,
+            )
+        else:
+            new_x, new_edge_attr, new_y = self.self_attn(X, edge_index, edge_attr, y, batch)
 
         X = self.normX1(X + new_x)
 
@@ -122,6 +179,17 @@ class GraphTransformerConv(nn.Module):
         dropout: 0.1,
         sn_hidden_dim: int,
         output_y: bool = False,
+        # 异质图相关参数
+        heterogeneous: bool = False,
+        num_node_types: int = 0,
+        num_node_subtypes: int = 0,
+        num_relation_types: int = 0,
+        type_embed_dim: int = 64,
+        subtype_embed_dim: int = 64,
+        relation_embed_dim: int = 64,
+        edge_family_offsets: Optional[dict] = None,
+        type_offsets: Optional[dict] = None,
+        use_type_modulation: bool = True,  # 是否使用类别调制子类别
     ):
         super().__init__()
         self.n_layers = n_layers
@@ -131,7 +199,14 @@ class GraphTransformerConv(nn.Module):
         self.out_dim_charge = output_dims.charge
         self.output_y = output_y
         self.dropout = dropout
+        self.heterogeneous = heterogeneous
+        self.type_offsets = type_offsets
 
+        # 调试信息：记录模型初始化时的input_dims
+        print(f"[DEBUG] GraphTransformerConv.__init__: input_dims.X = {input_dims.X}, input_dims.E = {input_dims.E}, input_dims.charge = {input_dims.charge}, sn_hidden_dim = {sn_hidden_dim}")
+        print(f"[DEBUG] GraphTransformerConv.__init__: lin_in_X输入维度 = {input_dims.X + input_dims.charge + sn_hidden_dim}, hidden_dims['dx'] = {hidden_dims['dx']}")
+        print(f"[DEBUG] GraphTransformerConv.__init__: lin_in_E输入维度 = {input_dims.E}, hidden_dims['de'] = {hidden_dims['de']}")
+        
         self.lin_in_X = nn.Linear(
             input_dims.X + input_dims.charge + sn_hidden_dim, hidden_dims["dx"]
         )
@@ -149,6 +224,15 @@ class GraphTransformerConv(nn.Module):
                     dim_ffX=hidden_dims["dim_ffX"],
                     dim_ffE=hidden_dims["dim_ffE"],
                     last_layer=True if output_y else (i < n_layers - 1),
+                    heterogeneous=heterogeneous,
+                    num_node_types=num_node_types,
+                    num_node_subtypes=num_node_subtypes,
+                    num_relation_types=num_relation_types,
+                    type_embed_dim=type_embed_dim,
+                    subtype_embed_dim=subtype_embed_dim,
+                    relation_embed_dim=relation_embed_dim,
+                    edge_family_offsets=edge_family_offsets,
+                    use_type_modulation=use_type_modulation,
                 )
                 for i in range(n_layers)
             ]
@@ -164,7 +248,19 @@ class GraphTransformerConv(nn.Module):
             self.out_ln_y = nn.LayerNorm(hidden_dims["dy"])
             self.lin_out_y = nn.Linear(hidden_dims["dy"], output_dims.y)
 
-    def forward(self, X, edge_attr, edge_index, y, batch):
+    def forward(
+        self, 
+        X, 
+        edge_attr, 
+        edge_index, 
+        y, 
+        batch,
+        # 异质图元数据（可选）
+        node_type_ids: Optional[Tensor] = None,
+        node_subtype_ids: Optional[Tensor] = None,
+        relation_type_ids: Optional[Tensor] = None,
+        edge_family_ids: Optional[Tensor] = None,
+    ):
         # Save for residual connection
         X0 = X.clone()
         edge_attr0 = edge_attr.clone()
@@ -177,7 +273,17 @@ class GraphTransformerConv(nn.Module):
 
         # Transformer layers
         for layer in self.tf_layers:
-            X, edge_attr, y = layer(X, edge_index, edge_attr, y, batch)
+            if self.heterogeneous:
+                X, edge_attr, y = layer(
+                    X, edge_index, edge_attr, y, batch,
+                    node_type_ids=node_type_ids,
+                    node_subtype_ids=node_subtype_ids,
+                    relation_type_ids=relation_type_ids,
+                    edge_family_ids=edge_family_ids,
+                    type_offsets=self.type_offsets,
+                )
+            else:
+                X, edge_attr, y = layer(X, edge_index, edge_attr, y, batch)
 
         # Output block
         X = self.lin_out_X(self.out_ln_X(X))
@@ -185,16 +291,23 @@ class GraphTransformerConv(nn.Module):
         if self.output_y:
             y = self.lin_out_y(self.out_ln_y(y))
 
-        # make results symmetrical
-        top_edge_index, top_edge_attr = sort_edge_index(edge_index, edge_attr)
-        _, bot_edge_attr = sort_edge_index(edge_index[[1, 0]], edge_attr)
+        # For heterogeneous directed relations, keep directional edge outputs.
+        # Symmetrizing (u->v) and (v->u) can blur relation direction semantics.
+        if self.heterogeneous:
+            edge_index_out = edge_index
+            edge_attr_out = edge_attr
+        else:
+            # Homogeneous/undirected setup: keep the original symmetric merge behavior.
+            edge_index_out, top_edge_attr = sort_edge_index(edge_index, edge_attr)
+            _, bot_edge_attr = sort_edge_index(edge_index[[1, 0]], edge_attr)
+            edge_attr_out = top_edge_attr + bot_edge_attr
 
         charges = (
             X[:, self.out_dim_X : self.out_dim_X + self.out_dim_charge]
             + X0[:, self.out_dim_X : self.out_dim_X + self.out_dim_charge]
         )
         X = X[:, : self.out_dim_X] + X0[:, : self.out_dim_X]
-        edge_attr = top_edge_attr + bot_edge_attr + edge_attr0[:, : self.out_dim_E]
+        edge_attr = edge_attr_out + edge_attr0[:, : self.out_dim_E]
 
         if self.output_y:
             y = y + y0[:, : self.out_dim_y]
@@ -202,7 +315,7 @@ class GraphTransformerConv(nn.Module):
         return utils.SparsePlaceHolder(
             node=X,
             edge_attr=edge_attr,
-            edge_index=top_edge_index,
+            edge_index=edge_index_out,
             y=y,
             batch=batch,
             charge=charges,

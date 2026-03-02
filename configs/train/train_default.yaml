@@ -1,11 +1,11 @@
 # Training settings
 n_epochs: 1000
 batch_size: 512
-lr: 0.0002
-clip_grad: null          # float, null to disable
-save_model: True
-num_workers: 16             # Increased for faster data loading (48 CPUs available)
-progress_bar: false
-weight_decay: 1e-12
-optimizer: adamw
-seed: 0
+lr: 0.0002  # 学习率
+clip_grad: null # 梯度裁剪 在反向传播后、参数更新前，对梯度做裁剪，避免梯度过大导致更新幅度爆炸 float, null to disable
+save_model: True # 是否保存 checkpoint	
+num_workers: 16  # DataLoader 子进程数 Increased for faster data loading (48 CPUs available)
+progress_bar: false  # 是否显式进度套
+weight_decay: 1e-12  # 权重衰减
+optimizer: adamw  # 优化器
+seed: 0 # 用于实验可复现的随机种子

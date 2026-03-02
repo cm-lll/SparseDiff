@@ -1,0 +1,30 @@
+# @package _global_
+# 使用 ACM 数据集，wandb 项目为 sparse_acm_subgraphs
+defaults:
+  - override /dataset: acm_subgraphs
+general:
+    name : 'acm_train'
+    sparse: True
+    gpus : 4
+    wandb: 'online'
+    sample_every_val: 5
+    samples_to_generate: 10
+    samples_to_save: 5
+    chains_to_save: 1
+    remove_h: True
+    number_chain_steps: 10
+    sample_num_nodes: null
+    final_model_samples_to_generate: 10
+    final_model_samples_to_save: 10
+train:
+    batch_size: 4
+    save_model: True
+    n_epochs: 200   # 与 2026-02-03 其余参数一致，仅把 100 提到 200
+    num_workers: 8  # 减少 DataLoader 瓶颈警告；机器核多可改为 16 或 24
+model:
+    n_layers: 4
+    diffusion_noise_schedule: 'cosine'
+    diffusion_steps: 100
+    hidden_mlp_dims: { 'X': 128, 'E': 64, 'y': 64 }
+    hidden_dims: {'dx': 128, 'de': 64, 'dy': 64, 'n_head': 8, 'dim_ffX': 256, 'dim_ffE': 128, 'dim_ffy': 128}
+    extra_features: 'all'

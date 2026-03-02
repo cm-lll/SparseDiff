@@ -5,7 +5,8 @@ import math
 
 from sparse_diffusion.utils import PlaceHolder
 from sparse_diffusion import utils
-from sparse_diffusion.diffusion.sample_edges import sample_query_edges
+from sparse_diffusion.diffusion.sample_edges import sample_query_edges, sampled_condensed_indices_uniformly
+from sparse_diffusion.diffusion.sample_edges_utils import condensed_to_matrix_index_batch
 
 
 def sum_except_batch(x):
@@ -647,6 +648,426 @@ def sample_sparse_discrete_feature_noise(limit_dist, node_mask):
         node=node, edge_index=edge_index.long(), edge_attr=edge_attr, y=y, charge=charge,
         batch=batch, ptr=ptr
     ).to_device(device)
+
+
+def sample_sparse_discrete_feature_noise_heterogeneous(limit_dist, node_mask, dataset_info, out_dims_E, device):
+    """异质图：从 limit 采节点；边数按训练集每族平均 edge_family_avg_edge_counts 初始化，
+    边对在各自关系族的合法 (src,dst) 上均匀采样，边类型从 limit_dist.E 的该族 slice 采样。
+    这样 z_T 的边数接近「真实图平均」，便于 |Eq|=k*m 的 m 在第一步就有合理起点。
+    """
+    node_mask = node_mask.to(device)
+    bs, n_max = node_mask.shape
+    batch = torch.where(node_mask > 0)[0]  # (N,) 每个节点所属图
+    n_node = node_mask.sum().int().item()
+    n_nodes = node_mask.sum(-1).long()  # (bs,)
+
+    # 获取必要的统计信息
+    edge_family_avg_edge_counts = getattr(dataset_info, "edge_family_avg_edge_counts", {}) or {}
+    edge_family_offsets = getattr(dataset_info, "edge_family_offsets", {}) or {}
+    fam_endpoints = getattr(dataset_info, "fam_endpoints", {}) or {}
+    type_offsets = getattr(dataset_info, "type_offsets", {}) or {}
+    id2edge_family = {v: k for k, v in getattr(dataset_info, "edge_family2id", {}).items()}
+    
+    if not edge_family_avg_edge_counts or not fam_endpoints or not type_offsets:
+        # 缺少异质信息时退回通用初始化
+        return sample_sparse_discrete_feature_noise(limit_dist, node_mask)
+    
+    # 节点初始化：按照用户描述的逻辑
+    # 1. 先按节点类型分布确定每个类型的节点数量
+    # 2. 然后对每个类型，按照该类型内的子类别分布分子类别
+    node_type_distribution = getattr(dataset_info, "node_type_distribution", None)
+    node_subtype_by_type = getattr(dataset_info, "node_subtype_by_type", None)
+    
+    # 获取节点类型名称列表（从type_offsets的键获取）
+    node_type_names = list(type_offsets.keys()) if type_offsets else []
+    
+    # type_sizes（节点类型子类个数），与 sample_p_zs_given_zt 一致
+    total_node_subtypes = int(limit_dist.X.shape[-1])
+    type_sizes = {}
+    sorted_ty = sorted(type_offsets.items(), key=lambda x: x[1])
+    for i, (t, off) in enumerate(sorted_ty):
+        if i + 1 < len(sorted_ty):
+            type_sizes[t] = sorted_ty[i + 1][1] - off
+        else:
+            # 最后一个类型的大小由全局子类别空间上界确定，避免临时值带来越界风险
+            type_sizes[t] = max(1, total_node_subtypes - off)
+    
+    x_limit = limit_dist.X[None, :].expand(n_node, -1).to(device) if n_node > 0 else None
+    
+    if node_type_distribution and node_subtype_by_type and len(node_type_names) > 0:
+        # 使用新的逻辑：先按类型分布，再按子类别分布
+        node_t = torch.zeros(n_node, dtype=torch.long, device=device)
+        node = torch.zeros(n_node, x_limit.shape[-1], dtype=torch.float, device=device)
+        
+        # 为每个图分别处理
+        for b in range(bs):
+            batch_mask = (batch == b)
+            n_b = batch_mask.sum().item()
+            if n_b == 0:
+                continue
+            
+            # 1. 按节点类型分布确定每个类型的节点数量
+            node_type_counts = {}
+            remaining = n_b
+            for i, node_type_name in enumerate(node_type_names):
+                if i == len(node_type_names) - 1:
+                    # 最后一个类型，分配剩余的所有节点
+                    node_type_counts[node_type_name] = remaining
+                else:
+                    prob = node_type_distribution.get(node_type_name, 1.0 / len(node_type_names))
+                    count = int(round(prob * n_b))
+                    count = min(count, remaining)
+                    node_type_counts[node_type_name] = count
+                    remaining -= count
+            
+            # 2. 对每个类型，按照该类型内的子类别分布分子类别
+            node_idx_in_batch = torch.where(batch_mask)[0]
+            current_idx = 0
+            for node_type_name, count in node_type_counts.items():
+                if count == 0:
+                    continue
+                if node_type_name not in type_offsets or node_type_name not in type_sizes:
+                    continue
+                
+                offset = type_offsets[node_type_name]
+                type_size = type_sizes[node_type_name]
+                
+                # 获取该类型的子类别分布
+                subtype_dist = node_subtype_by_type.get(node_type_name)
+                if subtype_dist is None:
+                    # 如果没有子类别分布，使用均匀分布
+                    subtype_dist = torch.ones(type_size, dtype=torch.float) / type_size
+                else:
+                    # 确保是tensor且归一化
+                    if isinstance(subtype_dist, torch.Tensor):
+                        subtype_dist = subtype_dist.to(device)
+                    else:
+                        subtype_dist = torch.tensor(subtype_dist, dtype=torch.float, device=device)
+                    if subtype_dist.sum() > 0:
+                        subtype_dist = subtype_dist / subtype_dist.sum()
+                    else:
+                        subtype_dist = torch.ones(type_size, dtype=torch.float, device=device) / type_size
+                
+                # 从子类别分布中采样
+                if count > 0:
+                    selected_indices = node_idx_in_batch[current_idx:current_idx + count]
+                    subtype_samples = subtype_dist.multinomial(count, replacement=True)  # (count,)
+                    global_subtype_ids = offset + subtype_samples  # (count,)
+                    
+                    # 设置节点类型和子类别
+                    node_t[selected_indices] = global_subtype_ids
+                    node[selected_indices] = F.one_hot(global_subtype_ids, num_classes=x_limit.shape[-1]).float()
+                    current_idx += count
+        
+        # 更新type_sizes（使用实际的node_t最大值）
+        if node_t.numel() > 0:
+            for i, (t, off) in enumerate(sorted_ty):
+                if i + 1 < len(sorted_ty):
+                    type_sizes[t] = sorted_ty[i + 1][1] - off
+                else:
+                    type_sizes[t] = max(1, total_node_subtypes - off)
+    else:
+        # 回退到原来的逻辑：从全局分布采样
+        node = x_limit.multinomial(1)[:, 0]
+        node = F.one_hot(node, num_classes=x_limit.shape[-1]).float()
+        node_t = node.argmax(dim=-1)  # (N,)
+        
+        # 更新type_sizes
+        for i, (t, off) in enumerate(sorted_ty):
+            if i + 1 < len(sorted_ty):
+                type_sizes[t] = sorted_ty[i + 1][1] - off
+            else:
+                type_sizes[t] = max(1, total_node_subtypes - off)
+    
+    y = torch.empty((bs, 0)).long().to(device)
+    charge = node.new_zeros((*node.shape[:-1], 0))
+    if limit_dist.charge.numel() > 0:
+        charge_limit = limit_dist.charge[None, :].expand(n_node, -1).to(device)
+        charge = charge_limit.multinomial(1)[:, 0]
+        charge = F.one_hot(charge, num_classes=charge_limit.shape[-1]).float()
+
+    ptr = torch.unique(batch, sorted=True, return_counts=True)[1]
+    ptr = torch.hstack([torch.tensor([0], device=device, dtype=torch.long), ptr.cumsum(-1)]).long()
+
+    E_limit = limit_dist.E.float().to(device)
+    all_ei, all_ea = [], []
+    
+    # 获取关系族分布和边子类别分布
+    edge_family_distribution = getattr(dataset_info, "edge_family_distribution", None)
+    edge_subtype_by_family = getattr(dataset_info, "edge_subtype_by_family", None)
+    edge_family_marginals = getattr(dataset_info, "edge_family_marginals", None)
+    edge_family2id = getattr(dataset_info, "edge_family2id", {}) or {}
+
+    # 边初始化：按照用户描述的逻辑
+    # 1. 先确定两个节点类型之间可能的关系族
+    # 2. 按照关系族分布确定各个关系族的边数量
+    # 3. 然后在对应的子类别中均匀选取边
+    
+    for b in range(bs):
+        batch_mask = (batch == b)
+        batch_node_t = node_t[batch_mask]  # 当前图的节点类型（全局子类别ID）
+        batch_nodes_global = torch.where(batch_mask)[0]
+        if batch_nodes_global.numel() == 0:
+            continue
+        # 固定当前图的哈希基数，确保跨类型对/跨关系族去重使用同一编码空间
+        graph_hash_base = int(batch_nodes_global.max().item()) + 1
+        # 记录当前图已经被任意关系族占用的有向边，保证同一 (u, v) 只保留一种关系
+        used_edge_hash = set()
+        
+        # 找到所有可能的节点类型对（src_type, dst_type）
+        type_pairs = set()
+        for fam_name, endpoints in fam_endpoints.items():
+            src_type = endpoints.get("src_type")
+            dst_type = endpoints.get("dst_type")
+            if src_type and dst_type and src_type in type_offsets and dst_type in type_offsets:
+                type_pairs.add((src_type, dst_type))
+        
+        # 对每个类型对，按照关系族分布确定边数量
+        for src_type, dst_type in type_pairs:
+            src_offset = type_offsets[src_type]
+            dst_offset = type_offsets[dst_type]
+            src_size = type_sizes.get(src_type, 0)
+            dst_size = type_sizes.get(dst_type, 0)
+            if src_size <= 0 or dst_size <= 0:
+                continue
+            
+            src_mask = (batch_node_t >= src_offset) & (batch_node_t < src_offset + src_size)
+            dst_mask = (batch_node_t >= dst_offset) & (batch_node_t < dst_offset + dst_size)
+            batch_src = torch.where(batch_mask)[0][src_mask]
+            batch_dst = torch.where(batch_mask)[0][dst_mask]
+            
+            if len(batch_src) == 0 or len(batch_dst) == 0:
+                continue
+            
+            num_src, num_dst = len(batch_src), len(batch_dst)
+            if src_type == dst_type:
+                num_possible = num_src * num_dst - num_src
+            else:
+                num_possible = num_src * num_dst
+            if num_possible <= 0:
+                continue
+            
+            # 获取该类型对的关系族分布
+            type_pair = (src_type, dst_type)
+            fam_dist = edge_family_distribution.get(type_pair, {}) if edge_family_distribution else {}
+            
+            # 如果没有关系族分布，使用edge_family_avg_edge_counts的旧逻辑
+            if not fam_dist:
+                # 回退到旧逻辑：直接使用edge_family_avg_edge_counts
+                for fam_id, fam_name in id2edge_family.items():
+                    if fam_name not in fam_endpoints:
+                        continue
+                    ep = fam_endpoints[fam_name]
+                    if ep.get("src_type") != src_type or ep.get("dst_type") != dst_type:
+                        continue
+                    
+                    m_fam = edge_family_avg_edge_counts.get(fam_name, 0.0)
+                    n_exist_fam = max(0, int(round(m_fam)))
+                    if n_exist_fam <= 0:
+                        continue
+                    
+                    n_fam_b = min(n_exist_fam, num_possible)
+                    if n_fam_b <= 0:
+                        continue
+                    
+                    # 采样边对和边类型（使用旧逻辑）
+                    n_added = _add_edges_for_family(
+                        batch_src, batch_dst, src_type, dst_type, num_src, num_dst,
+                        fam_name, fam_id, n_fam_b, num_possible,
+                        edge_family_offsets, edge_subtype_by_family, edge_family_marginals,
+                        E_limit, out_dims_E, device, all_ei, all_ea, edge_family2id,
+                        forbidden_hash=used_edge_hash, hash_base=graph_hash_base,
+                    )
+                    num_possible = max(num_possible - n_added, 0)
+            else:
+                # 新逻辑：按照关系族分布确定各个关系族的边数量
+                total_edges_for_pair = min(int(round(sum(edge_family_avg_edge_counts.get(fam_name, 0.0) 
+                                                         for fam_name in fam_dist.keys()))), num_possible)
+                
+                remaining_edges = total_edges_for_pair
+                for fam_name, fam_prob in fam_dist.items():
+                    if remaining_edges <= 0:
+                        break
+                    
+                    if fam_name not in edge_family2id:
+                        continue
+                    fam_id = edge_family2id[fam_name]
+                    
+                    # 计算该关系族的边数量
+                    n_fam = int(round(fam_prob * total_edges_for_pair))
+                    n_fam = min(n_fam, remaining_edges, num_possible)
+                    if n_fam <= 0:
+                        continue
+                    
+                    # 采样边对和边类型
+                    n_added = _add_edges_for_family(
+                        batch_src, batch_dst, src_type, dst_type, num_src, num_dst,
+                        fam_name, fam_id, n_fam, num_possible,
+                        edge_family_offsets, edge_subtype_by_family, edge_family_marginals,
+                        E_limit, out_dims_E, device, all_ei, all_ea, edge_family2id,
+                        forbidden_hash=used_edge_hash, hash_base=graph_hash_base,
+                    )
+                    
+                    remaining_edges = max(remaining_edges - n_added, 0)
+                    num_possible = max(num_possible - n_added, 0)  # 更新剩余可能的边数
+
+    if len(all_ei) == 0:
+        edge_index = torch.zeros(2, 0, device=device, dtype=torch.long)
+        edge_attr = F.one_hot(torch.zeros(0, device=device, dtype=torch.long), num_classes=out_dims_E).float()
+    else:
+        edge_index = torch.cat(all_ei, dim=1)
+        edge_attr_d = torch.cat(all_ea, dim=0)
+        # 异质图：关系是有向的，不应该转换为无向边
+        # 否则会导致反向边（如Paper->Author）没有匹配的关系族，只能允许no-edge
+        # 例如：author_of是Author->Paper，不应该添加Paper->Author
+        # 因此异质图模式下不使用to_undirected，保持有向边
+        edge_attr = F.one_hot(edge_attr_d.long(), num_classes=out_dims_E).float()
+
+    return utils.SparsePlaceHolder(
+        node=node, edge_index=edge_index, edge_attr=edge_attr, y=y, charge=charge,
+        batch=batch, ptr=ptr
+    ).to_device(device)
+
+
+def _add_edges_for_family(batch_src, batch_dst, src_type, dst_type, num_src, num_dst,
+                         fam_name, fam_id, n_fam, num_possible,
+                         edge_family_offsets, edge_subtype_by_family, edge_family_marginals, E_limit,
+                         out_dims_E, device, all_ei, all_ea, edge_family2id=None,
+                         forbidden_hash=None, hash_base=None):
+    """辅助函数：为特定关系族添加边"""
+    if n_fam <= 0:
+        return 0
+    if forbidden_hash is None:
+        forbidden_hash = set()
+
+    offset = edge_family_offsets.get(fam_name, 0)
+    next_offset = out_dims_E
+    for _, o in edge_family_offsets.items():
+        if o > offset and o < next_offset:
+            next_offset = o
+    
+    if src_type == dst_type:
+        # Directed same-type relations use n*(n-1) ordered pairs (exclude self-loops).
+        # Map an index in [0, n*(n-1)) to (u, v):
+        #   u = idx // (n - 1), v = idx % (n - 1), and if v >= u then v += 1.
+        max_c = num_src * (num_src - 1)
+        if max_c <= 0:
+            return 0
+        max_t = torch.tensor([max_c], device=device, dtype=torch.long)
+        num_t = torch.tensor([n_fam], device=device, dtype=torch.long)
+        flat, _ = sampled_condensed_indices_uniformly(
+            max_condensed_value=max_t,
+            num_edges_to_sample=num_t,
+            return_mask=False,
+        )
+        if flat.numel() == 0:
+            return 0
+        u_local = (flat // (num_src - 1)).long()
+        v_local = (flat % (num_src - 1)).long()
+        v_local = v_local + (v_local >= u_local).long()
+        ei = torch.stack([batch_src[u_local], batch_src[v_local]], dim=0)
+    else:
+        max_c = num_src * num_dst
+        max_t = torch.tensor([max_c], device=device, dtype=torch.long)
+        num_t = torch.tensor([n_fam], device=device, dtype=torch.long)
+        flat, _ = sampled_condensed_indices_uniformly(max_condensed_value=max_t, num_edges_to_sample=num_t, return_mask=False)
+        si = (flat % num_dst).long().clamp(0, num_dst - 1)
+        di = (flat // num_dst).long().clamp(0, num_src - 1)
+        ei = torch.stack([batch_src[di], batch_dst[si]], dim=0)
+
+    # 过滤已被其它关系族占用的边，保证 (u, v) 关系唯一。
+    if hash_base is None:
+        if batch_src.numel() > 0 or batch_dst.numel() > 0:
+            hash_base = int(torch.max(torch.cat([batch_src, batch_dst])).item()) + 1
+        else:
+            hash_base = 1
+    selected_src = []
+    selected_dst = []
+    selected_hash = set()
+    for k in range(ei.shape[1]):
+        s = int(ei[0, k].item())
+        d = int(ei[1, k].item())
+        h = s * hash_base + d
+        if h in forbidden_hash or h in selected_hash:
+            continue
+        selected_hash.add(h)
+        selected_src.append(s)
+        selected_dst.append(d)
+
+    # 若过滤后不足，补采样（拒绝采样），直到达到 n_fam 或达到尝试上限。
+    max_tries = max(n_fam * 20, 1000)
+    tries = 0
+    same_type = src_type == dst_type
+    while len(selected_src) < n_fam and tries < max_tries:
+        remaining = n_fam - len(selected_src)
+        cand_n = min(remaining * 10, 10000)
+        src_idx = torch.randint(0, num_src, (cand_n,), device="cpu")
+        if same_type:
+            dst_idx = torch.randint(0, num_src, (cand_n,), device="cpu")
+        else:
+            dst_idx = torch.randint(0, num_dst, (cand_n,), device="cpu")
+        for i in range(cand_n):
+            s = int(batch_src[src_idx[i]].item())
+            d = int((batch_src if same_type else batch_dst)[dst_idx[i]].item())
+            if same_type and s == d:
+                continue
+            h = s * hash_base + d
+            if h in forbidden_hash or h in selected_hash:
+                continue
+            selected_hash.add(h)
+            selected_src.append(s)
+            selected_dst.append(d)
+            if len(selected_src) >= n_fam:
+                break
+        tries += cand_n
+
+    if len(selected_src) == 0:
+        return 0
+    ei = torch.tensor([selected_src, selected_dst], dtype=torch.long, device=device)
+    
+    # 边类型：使用关系族内的子类别分布（如果可用），否则使用全局分布
+    num_subtypes = next_offset - offset
+    if edge_subtype_by_family and fam_name in edge_subtype_by_family:
+        # 使用关系族内的子类别分布
+        subtype_dist = edge_subtype_by_family[fam_name]
+        if isinstance(subtype_dist, torch.Tensor):
+            subtype_dist = subtype_dist.to(device)
+        else:
+            subtype_dist = torch.tensor(subtype_dist, dtype=torch.float, device=device)
+        if subtype_dist.sum() > 0:
+            subtype_dist = subtype_dist / subtype_dist.sum()
+        else:
+            subtype_dist = torch.ones(num_subtypes, dtype=torch.float, device=device) / num_subtypes
+        
+        # 从子类别分布中采样
+        sidx = subtype_dist.multinomial(ei.shape[1], replacement=True)  # (E,)
+    else:
+        # 回退到关系族边际分布（优先），否则全局分布
+        subtype_dist = None
+        if edge_family_marginals and fam_name in edge_family_marginals:
+            fam_marginals = edge_family_marginals[fam_name]
+            if not isinstance(fam_marginals, torch.Tensor):
+                fam_marginals = torch.tensor(fam_marginals, dtype=torch.float, device=device)
+            else:
+                fam_marginals = fam_marginals.to(device)
+            if fam_marginals.numel() > 1:
+                subtype_dist = fam_marginals[1:]
+        if subtype_dist is None:
+            sl = E_limit[offset:next_offset]
+            if sl.numel() == 0:
+                return 0
+            subtype_dist = sl
+        if subtype_dist.sum() > 0:
+            subtype_dist = subtype_dist / subtype_dist.sum()
+        else:
+            subtype_dist = torch.ones(num_subtypes, dtype=torch.float, device=device) / num_subtypes
+        sidx = subtype_dist.multinomial(ei.shape[1], replacement=True)
+    
+    global_id = (offset + sidx).long().clamp(0, out_dims_E - 1)
+    all_ei.append(ei)
+    all_ea.append(global_id)
+    forbidden_hash.update(selected_hash)
+    return int(ei.shape[1])
 
 
 def compute_sparse_batched_over0_posterior_distribution(

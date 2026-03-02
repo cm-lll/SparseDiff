@@ -156,6 +156,8 @@ class AbstractDatasetInfos:
         self.charge_types = statistics["train"].charge_types
         self.num_node_types = len(self.node_types)
         self.num_edge_types = len(self.edge_types)
+        # 调试信息：记录num_edge_types的值
+        print(f"[DEBUG] AbstractDatasetInfos.complete_infos: bond_types长度={len(self.edge_types)}, num_edge_types={self.num_edge_types}")
         self.num_charge_types = self.charge_types.shape[-1] if self.use_charge else 0
 
         # Train + val + test for n_nodes
@@ -185,12 +187,20 @@ class AbstractDatasetInfos:
             example_batch.charge,
         )
 
+        # 调试信息：记录example_batch的实际维度
+        print(f"[DEBUG] compute_input_dims: example_batch.edge_attr.shape = {example_batch.edge_attr.shape}")
+        print(f"[DEBUG] compute_input_dims: example_batch.x.shape = {example_batch.x.shape}")
+        print(f"[DEBUG] compute_input_dims: num_edge_types = {self.num_edge_types}")
+        
         self.input_dims = utils.PlaceHolder(
             X=example_batch.x.size(1),
             E=example_batch.edge_attr.size(1),
             y=example_batch.y.size(1) + 1 if example_batch.y is not None else 1,
             charge=self.num_charge_types,
         )
+        
+        # 调试信息：记录初始input_dims
+        print(f"[DEBUG] compute_input_dims: 初始 input_dims.E = {self.input_dims.E}, 期望应该是 num_edge_types = {self.num_edge_types}")
 
         example_data = {
             "node_t": example_batch.x,
@@ -205,17 +215,23 @@ class AbstractDatasetInfos:
         if type(ex_extra_feat) == tuple:
             ex_extra_feat = ex_extra_feat[0]
         try:
-            self.input_dims.X += ex_extra_feat.X.size(-1)
-            self.input_dims.E += ex_extra_feat.E.size(-1)
+            extra_X_dim = ex_extra_feat.X.size(-1) if hasattr(ex_extra_feat, 'X') else 0
+            extra_E_dim = ex_extra_feat.E.size(-1) if hasattr(ex_extra_feat, 'E') else 0
+            self.input_dims.X += extra_X_dim
+            self.input_dims.E += extra_E_dim
             self.input_dims.y += ex_extra_feat.y.size(-1)
+            print(f"[DEBUG] compute_input_dims: extra_features添加 X维度={extra_X_dim}, E维度={extra_E_dim}, 当前 input_dims.X = {self.input_dims.X}, input_dims.E = {self.input_dims.E}")
         except:
             # 兼容旧格式（SparsePlaceHolder 或其他格式）
             if hasattr(ex_extra_feat, 'node'):
+                extra_E_dim = ex_extra_feat.edge_attr.size(-1) if hasattr(ex_extra_feat, 'edge_attr') else 0
                 self.input_dims.X += ex_extra_feat.node.size(-1)
-                self.input_dims.E += ex_extra_feat.edge_attr.size(-1)
+                self.input_dims.E += extra_E_dim
                 self.input_dims.y += ex_extra_feat.y.size(-1)
+                print(f"[DEBUG] compute_input_dims: extra_features(旧格式)添加 E维度={extra_E_dim}, 当前 input_dims.E = {self.input_dims.E}")
             else:
                 # 如果都没有，跳过（DummyExtraFeatures 返回空特征）
+                print(f"[DEBUG] compute_input_dims: extra_features无E特征，当前 input_dims.E = {self.input_dims.E}")
                 pass
             
         mol_extra_feat = domain_features(example_data)
@@ -223,13 +239,19 @@ class AbstractDatasetInfos:
             mol_extra_feat = mol_extra_feat[0]
         # 兼容 PlaceHolder 和旧格式
         if hasattr(mol_extra_feat, 'X'):
-            self.input_dims.X += mol_extra_feat.X.size(-1)
-            self.input_dims.E += mol_extra_feat.E.size(-1)
+            domain_X_dim = mol_extra_feat.X.size(-1) if hasattr(mol_extra_feat, 'X') else 0
+            domain_E_dim = mol_extra_feat.E.size(-1) if hasattr(mol_extra_feat, 'E') else 0
+            self.input_dims.X += domain_X_dim
+            self.input_dims.E += domain_E_dim
             self.input_dims.y += mol_extra_feat.y.size(-1)
+            print(f"[DEBUG] compute_input_dims: domain_features添加 X维度={domain_X_dim}, E维度={domain_E_dim}, 最终 input_dims.X = {self.input_dims.X}, input_dims.E = {self.input_dims.E}")
         elif hasattr(mol_extra_feat, 'node'):
+            domain_E_dim = mol_extra_feat.edge_attr.size(-1) if hasattr(mol_extra_feat, 'edge_attr') else 0
             self.input_dims.X += mol_extra_feat.node.size(-1)
-            self.input_dims.E += mol_extra_feat.edge_attr.size(-1)
+            self.input_dims.E += domain_E_dim
             self.input_dims.y += mol_extra_feat.y.size(-1)
+            print(f"[DEBUG] compute_input_dims: domain_features(旧格式)添加 E维度={domain_E_dim}, 最终 input_dims.E = {self.input_dims.E}")
         else:
             # 如果都没有，跳过（DummyExtraFeatures 返回空特征）
+            print(f"[DEBUG] compute_input_dims: domain_features无E特征，最终 input_dims.E = {self.input_dims.E}")
             pass

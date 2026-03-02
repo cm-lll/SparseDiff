@@ -22,6 +22,7 @@ class DummyExtraFeatures:
     def __call__(self, noisy_data, sparse=True):
         # compute_extra_data 期望返回 PlaceHolder（密集格式），即使输入是稀疏的
         # 所以我们需要将稀疏数据转换为密集格式
+        # 原始 DiGress 用密集格式，SparseDiff 改成稀疏格式以支持大图
         
         if "X_t" in noisy_data:
             # 已经是密集格式
@@ -87,7 +88,13 @@ class ExtraFeatures:
         
         if use_positional:
             self.positional_encoding = PositionalEncoding(dataset_info.max_n_nodes)
-        self.adj_features = AdjacencyFeatures(edge_features_type, num_degree=num_degree, dist_feat=dist_feat)
+        self.adj_features = AdjacencyFeatures(
+            edge_features_type, num_degree=num_degree, dist_feat=dist_feat,
+            heterogeneous=self.heterogeneous,
+        )
+        self.hetero_global_features = None
+        if self.heterogeneous:
+            self.hetero_global_features = HeterogeneousGlobalFeatures(dataset_info=dataset_info)
         
         # 对于异质图，使用专门设计的 HeterogeneousGraphFeatures
         # 对于同质图，使用 EigenFeatures
@@ -111,6 +118,8 @@ class ExtraFeatures:
         n = noisy_data["node_mask"].sum(dim=1).unsqueeze(1) / self.max_n_nodes
         start_time = time.time()
         x_feat, y_feat, edge_feat = self.adj_features(noisy_data)  # (bs, n_cycles)
+        if self.heterogeneous and self.hetero_global_features is not None:
+            y_feat = self.hetero_global_features(noisy_data)
         y_feat = torch.hstack((y_feat, n))
         cycle_time = round(time.time() - start_time, 2)
         eigen_time = 0.
@@ -152,6 +161,112 @@ class ExtraFeatures:
                 y_feat = torch.hstack((y_feat, eval_feat))
 
         return utils.PlaceHolder(X=x_feat, E=edge_feat, y=y_feat), cycle_time, eigen_time
+
+
+class HeterogeneousGlobalFeatures:
+    """Fixed-size graph-level features for heterogeneous graphs."""
+    def __init__(self, dataset_info):
+        self.type_offsets = getattr(dataset_info, "type_offsets", {}) or {}
+        self.node_type_names = getattr(dataset_info, "node_type_names", []) or list(self.type_offsets.keys())
+        self.edge_family_offsets = getattr(dataset_info, "edge_family_offsets", {}) or {}
+        self.output_dims = getattr(dataset_info, "output_dims", None)
+        self.num_node_subtypes = getattr(dataset_info, "num_node_subtypes", None)
+
+        # order node types by offset for consistency
+        sorted_types = sorted(self.type_offsets.items(), key=lambda x: x[1])
+        self.type_names_ordered = [t for t, _ in sorted_types]
+        self.type_sizes = {}
+        for i, (t, off) in enumerate(sorted_types):
+            if i + 1 < len(sorted_types):
+                self.type_sizes[t] = sorted_types[i + 1][1] - off
+            else:
+                if self.num_node_subtypes is not None:
+                    self.type_sizes[t] = max(1, self.num_node_subtypes - off)
+                else:
+                    self.type_sizes[t] = max(1, off + 1)
+
+        # edge family ranges ordered by offset
+        self.family_names = []
+        self.family_ranges = []
+        if self.edge_family_offsets:
+            fam_sorted = sorted(self.edge_family_offsets.items(), key=lambda x: x[1])
+            out_dims_e = getattr(self.output_dims, "E", None)
+            for i, (fam, off) in enumerate(fam_sorted):
+                if i + 1 < len(fam_sorted):
+                    nxt = fam_sorted[i + 1][1]
+                else:
+                    nxt = out_dims_e if out_dims_e is not None else off + 1
+                self.family_names.append(fam)
+                self.family_ranges.append((off, max(off + 1, nxt)))
+
+        self.type_pairs = [(i, j) for i in range(len(self.type_names_ordered))
+                           for j in range(len(self.type_names_ordered))]
+
+    def __call__(self, noisy_data):
+        X = noisy_data["X_t"]
+        E = noisy_data["E_t"]
+        node_mask = noisy_data["node_mask"]
+        bs, n = node_mask.shape
+        device = X.device
+
+        if self.num_node_subtypes is None and self.output_dims is not None:
+            self.num_node_subtypes = getattr(self.output_dims, "X", None)
+
+        if not self.type_names_ordered or not self.family_ranges:
+            return X.new_zeros((bs, 0))
+
+        num_subtypes = self.num_node_subtypes or X.shape[-1]
+        X_base = X[..., :num_subtypes] if X.shape[-1] > num_subtypes else X
+        subtype_ids = X_base.argmax(dim=-1)
+
+        # node type ids
+        node_type_ids = subtype_ids.new_full(subtype_ids.shape, -1)
+        for idx, tname in enumerate(self.type_names_ordered):
+            off = self.type_offsets[tname]
+            size = self.type_sizes.get(tname, 1)
+            tmask = (subtype_ids >= off) & (subtype_ids < off + size)
+            node_type_ids[tmask] = idx
+        node_type_ids[~node_mask] = -1
+
+        # node type distribution
+        type_counts = []
+        for idx in range(len(self.type_names_ordered)):
+            type_counts.append((node_type_ids == idx).sum(dim=1).float())
+        type_counts = torch.stack(type_counts, dim=1)
+        denom = type_counts.sum(dim=1, keepdim=True)
+        denom[denom == 0] = 1
+        node_type_dist = type_counts / denom
+
+        # edge type ids
+        edge_type_ids = E.argmax(dim=-1)
+        eye = torch.eye(n, device=device, dtype=torch.bool).unsqueeze(0)
+        valid_edges = node_mask.unsqueeze(2) & node_mask.unsqueeze(1) & (~eye)
+
+        pair_fam_density = []
+        for src_idx, dst_idx in self.type_pairs:
+            src_mask = (node_type_ids == src_idx).unsqueeze(2)
+            dst_mask = (node_type_ids == dst_idx).unsqueeze(1)
+            pair_mask = src_mask & dst_mask & valid_edges
+
+            num_src = (node_type_ids == src_idx).sum(dim=1).float()
+            num_dst = (node_type_ids == dst_idx).sum(dim=1).float()
+            if src_idx == dst_idx:
+                possible = num_src * (num_src - 1)
+            else:
+                possible = num_src * num_dst
+            possible = possible.clamp(min=1)
+
+            for st, en in self.family_ranges:
+                fam_mask = (edge_type_ids >= st) & (edge_type_ids < en)
+                count = (pair_mask & fam_mask).sum(dim=(1, 2)).float()
+                pair_fam_density.append(count / possible)
+
+        if pair_fam_density:
+            pair_fam_density = torch.stack(pair_fam_density, dim=1)
+        else:
+            pair_fam_density = X.new_zeros((bs, 0))
+
+        return torch.cat([node_type_dist, pair_fam_density], dim=1)
 
 
 class PositionalEncoding:
@@ -491,39 +606,49 @@ class EigenFeatures:
 
 
 class AdjacencyFeatures:
-    """Builds cycle counts for each node in a graph."""
-    def __init__(self, edge_features_type, num_degree, max_degree=10, dist_feat=True):
+    """Builds cycle counts for each node in a graph.
+    异质图下：环、path、Adamic–Adar 在混合邻接上语义错配，故关掉（置零），
+    仅保留 dist_feat（度 / node_dist / edge_dist）；结构先验由 HeterogeneousGraphFeatures 提供。
+    """
+    def __init__(self, edge_features_type, num_degree, max_degree=10, dist_feat=True, heterogeneous=False):
         self.edge_features_type = edge_features_type
         self.max_degree = max_degree
         self.num_degree = num_degree
         self.dist_feat = dist_feat
+        self.heterogeneous = heterogeneous
 
     def __call__(self, noisy_data):
         adj_matrix = noisy_data["E_t"][..., 1:].int().sum(dim=-1)  # (bs, n, n)
         num_nodes = noisy_data["node_mask"].sum(dim=1)
-        self.calculate_kpowers(adj_matrix)
+        bs, n = adj_matrix.shape[0], adj_matrix.shape[1]
+        device = adj_matrix.device
 
-        k3x, k3y = self.k3_cycle()
-        k4x, k4y = self.k4_cycle()
-        k5x, k5y = self.k5_cycle()
-        _, k6y = self.k6_cycle()
-
-        kcyclesx = torch.cat([k3x, k4x, k5x], dim=-1)
-        kcyclesy = torch.cat([k3y, k4y, k5y, k6y], dim=-1)
-
-        if self.edge_features_type == "dist":
-            edge_feats = self.path_features()
-        elif self.edge_features_type == "localngbs":
-            edge_feats = self.local_neighbors(num_nodes)
-        elif self.edge_features_type == "all":
-            dist = self.path_features()
-            local_ngbs = self.local_neighbors(num_nodes)
-            edge_feats = torch.cat([dist, local_ngbs], dim=-1)
+        if self.heterogeneous:
+            # 异质图：环、path、Adamic–Adar 关掉，避免混合邻接带来的语义错配
+            kcyclesx = torch.zeros(bs, n, 3, device=device)
+            kcyclesy_part = torch.zeros(bs, 4, device=device)
+            edge_feats = torch.zeros((*adj_matrix.shape, 0), device=device)
         else:
-            edge_feats = torch.zeros((*adj_matrix.shape, 0), device=adj_matrix.device)
+            self.calculate_kpowers(adj_matrix)
+            k3x, k3y = self.k3_cycle()
+            k4x, k4y = self.k4_cycle()
+            k5x, k5y = self.k5_cycle()
+            _, k6y = self.k6_cycle()
+            kcyclesx = torch.cat([k3x, k4x, k5x], dim=-1)
+            kcyclesy_part = torch.clamp(torch.cat([k3y, k4y, k5y, k6y], dim=-1), 0, 5) / 5
+            if self.edge_features_type == "dist":
+                edge_feats = self.path_features()
+            elif self.edge_features_type == "localngbs":
+                edge_feats = self.local_neighbors(num_nodes)
+            elif self.edge_features_type == "all":
+                dist = self.path_features()
+                local_ngbs = self.local_neighbors(num_nodes)
+                edge_feats = torch.cat([dist, local_ngbs], dim=-1)
+            else:
+                edge_feats = torch.zeros((*adj_matrix.shape, 0), device=device)
 
         kcyclesx = torch.clamp(kcyclesx, 0, 5) / 5 * noisy_data["node_mask"].unsqueeze(-1)
-        y_feat = [torch.clamp(kcyclesy, 0, 5) / 5]
+        y_feat = [kcyclesy_part]
         edge_feats = torch.clamp(edge_feats, 0, 5) / 5
 
         if self.dist_feat:

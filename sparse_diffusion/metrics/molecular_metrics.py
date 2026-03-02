@@ -47,7 +47,8 @@ class TrainMolecularMetricsDiscrete(nn.Module):
         for metric in [self.train_atom_metrics, self.train_bond_metrics]:
             metric.reset()
 
-    def log_epoch_metrics(self):
+    def log_epoch_metrics(self, log_step=None):
+        """log_step: 若传入（如 current_epoch），wandb 横轴为该值。"""
         epoch_atom_metrics = self.train_atom_metrics.compute()
         epoch_bond_metrics = self.train_bond_metrics.compute()
 
@@ -57,7 +58,10 @@ class TrainMolecularMetricsDiscrete(nn.Module):
         for key, val in epoch_bond_metrics.items():
             to_log["train_epoch/" + key] = val.item()
         if wandb.run:
-            wandb.log(to_log, commit=False)
+            if log_step is not None:
+                wandb.log(to_log, step=log_step, commit=False)
+            else:
+                wandb.log(to_log, commit=False)
 
         for key, val in epoch_atom_metrics.items():
             epoch_atom_metrics[key] = val.item()

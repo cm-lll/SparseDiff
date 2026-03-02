@@ -69,3 +69,15 @@ This code was tested with PyTorch 2.0.1, cuda 11.8 and torch_geometrics 2.3.1
 ## Troubleshooting 
 
 `PermissionError: [Errno 13] Permission denied: 'SparseDiff/sparse_diffusion/analysis/orca/orca'`: You probably did not compile orca.
+
+**输出目录下没有日志、没有 charts**：原因与排查见 `LOGGING_AND_OUTPUTS.md`（输出在 `gnn_project/outputs/` 不在 `SparseDiff/outputs`；`logger=[]` 不写 Lightning 日志；charts 只在 wandb）。
+
+`GLIBCXX_3.4.29' not found` (from rdkit, PIL, etc.): The conda env’s `libstdcxx-ng` already provides it; the system’s older `/usr/lib/.../libstdc++.so.6` is being loaded first. Use the conda one by setting:
+```bash
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+```
+after `conda activate sparse`. To make this permanent for the `sparse` env:
+```bash
+source scripts/fix_libstdc_conda.sh --install
+```
+Optional upgrade of `libstdcxx-ng` (no conflict with SparseDiff): `scripts/fix_libstdc_conda.sh --upgrade`.
