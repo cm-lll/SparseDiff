@@ -82,7 +82,27 @@ class DiscreteDenoisingDiffusion(pl.LightningModule):
         self.name = cfg.general.name
         self.T = cfg.model.diffusion_steps
 
-        self.train_loss = TrainLossDiscrete(cfg.model.lambda_train, self.edge_fraction, self.dataset_info)
+        self.train_loss = TrainLossDiscrete(
+            cfg.model.lambda_train,
+            self.edge_fraction,
+            self.dataset_info,
+            relation_matrix_loss_weight=getattr(cfg.model, "relation_matrix_loss_weight", 0.0),
+            relation_matrix_loss_normalize=getattr(cfg.model, "relation_matrix_loss_normalize", True),
+            use_edge_subtype_ce=getattr(cfg.model, "use_edge_subtype_ce", True),
+            metapath2_loss_weight=getattr(cfg.model, "metapath2_loss_weight", 0.0),
+            metapath2_loss_normalize=getattr(cfg.model, "metapath2_loss_normalize", True),
+            structure_only=getattr(cfg.model, "structure_only", False),
+            subtype_degree_loss_weight=getattr(cfg.model, "subtype_degree_loss_weight", 0.0),
+            subtype_degree_loss_normalize=getattr(cfg.model, "subtype_degree_loss_normalize", True),
+            subtype_degree_max=getattr(cfg.model, "subtype_degree_max", getattr(cfg.model, "num_degree", 10)),
+        )
+        # 验证阶段用与训练相同的基础度量：relation_matrix_L1、metapath2_L1 的累加器（每 epoch 重置）
+        self._val_relation_matrix_L1_sum = 0.0
+        self._val_relation_matrix_L1_count = 0
+        self._val_metapath2_L1_sum = 0.0
+        self._val_metapath2_L1_count = 0
+        self._val_subtype_degree_L1_sum = 0.0
+        self._val_subtype_degree_L1_count = 0
         self.train_metrics = train_metrics
         self.val_sampling_metrics = val_sampling_metrics
         self.test_sampling_metrics = test_sampling_metrics
@@ -194,6 +214,8 @@ class DiscreteDenoisingDiffusion(pl.LightningModule):
         
         # 检查是否为异质图模式
         self.heterogeneous = getattr(self.dataset_info, "heterogeneous", False)
+        # 只关注结构：不扩散/不预测节点，不做边一一子类 CE，损失仅用 relation_matrix_L1 + metapath2_L1
+        self.structure_only = getattr(cfg.model, "structure_only", False)
         # 边采样：True=先采样存在性再采样子类型（与分层损失一致）；False=对所有类做一次 multinomial
         self.hierarchical_edge_sampling = getattr(cfg.model, "hierarchical_edge_sampling", self.heterogeneous)
         if self.heterogeneous and hasattr(self.dataset_info, "edge_family_marginals") and len(self.dataset_info.edge_family_marginals) > 0:
@@ -733,12 +755,20 @@ class DiscreteDenoisingDiffusion(pl.LightningModule):
         e_ce = epoch_loss.get("train_epoch/E_CE", -1)
         charge_ce = epoch_loss.get("train_epoch/charge_CE", -1)
         y_ce = epoch_loss.get("train_epoch/y_CE", -1)
-        self.print(
-            f"Epoch {self.current_epoch} finished: X: {x_ce :.2f} -- "
-            f"E: {e_ce :.2f} --"
-            f"charge: {charge_ce :.2f} --"
-            f"y: {y_ce :.2f}"
-        )
+        if getattr(self, "structure_only", False):
+            self.print(
+                f"Epoch {self.current_epoch} finished: structure_only (L1 only) -- "
+                f"relation_matrix_L1: {epoch_loss.get('train_epoch/relation_matrix_L1', -1):.4f} -- "
+                f"metapath2_L1: {epoch_loss.get('train_epoch/metapath2_L1', -1):.4f} -- "
+                f"subtype_degree_L1: {epoch_loss.get('train_epoch/subtype_degree_L1', -1):.4f}"
+            )
+        else:
+            self.print(
+                f"Epoch {self.current_epoch} finished: X: {x_ce :.2f} -- "
+                f"E: {e_ce :.2f} --"
+                f"charge: {charge_ce :.2f} --"
+                f"y: {y_ce :.2f}"
+            )
         epoch_node_metrics, epoch_edge_metrics = self.train_metrics.log_epoch_metrics(log_step=self.current_epoch)
 
         if wandb.run:
@@ -899,6 +929,12 @@ class DiscreteDenoisingDiffusion(pl.LightningModule):
             val_metrics.extend([self.val_charge_kl, self.val_charge_logp])
         for metric in val_metrics:
             metric.reset()
+        self._val_relation_matrix_L1_sum = 0.0
+        self._val_relation_matrix_L1_count = 0
+        self._val_metapath2_L1_sum = 0.0
+        self._val_metapath2_L1_count = 0
+        self._val_subtype_degree_L1_sum = 0.0
+        self._val_subtype_degree_L1_count = 0
 
     def validation_step(self, data, i):
         """
@@ -1478,6 +1514,82 @@ class DiscreteDenoisingDiffusion(pl.LightningModule):
             if hasattr(self, "local_rank") and self.local_rank == 0:
                 print(f"[VAL-PRED-GRAPH] build failed: {_e}", flush=True)
 
+        # 验证阶段用与训练相同的基础度量：在验证集上计算 relation_matrix_L1、metapath2_L1 并累加
+        if (
+            getattr(self.train_loss, "relation_matrix_loss_weight", 0.0) > 0
+            or getattr(self.train_loss, "metapath2_loss_weight", 0.0) > 0
+            or getattr(self.train_loss, "subtype_degree_loss_weight", 0.0) > 0
+        ) and all_edge_index.shape[1] > 0:
+            try:
+                with torch.no_grad():
+                    # 从 data 中收集与 all_edge_index 对应的真实边标签（用于与 pred 同口径）
+                    edge_to_attr = {}
+                    for j in range(data.edge_index.size(1)):
+                        key = (
+                            data.edge_index[0, j].item(),
+                            data.edge_index[1, j].item(),
+                        )
+                        edge_to_attr[key] = data.edge_attr[j]
+                    num_edge_types = data.edge_attr.size(-1)
+                    device = data.edge_attr.device
+                    dtype = data.edge_attr.dtype
+                    true_attr_list = []
+                    for k in range(all_edge_index.size(1)):
+                        key = (
+                            all_edge_index[0, k].item(),
+                            all_edge_index[1, k].item(),
+                        )
+                        if key in edge_to_attr:
+                            true_attr_list.append(edge_to_attr[key])
+                        else:
+                            no_edge = torch.zeros(
+                                num_edge_types, device=device, dtype=dtype
+                            )
+                            no_edge[0] = 1.0
+                            true_attr_list.append(no_edge)
+                    true_attr_gathered = torch.stack(true_attr_list, dim=0)
+                    sparse_pred_ph = utils.SparsePlaceHolder(
+                        node=all_node,
+                        edge_index=all_edge_index,
+                        edge_attr=all_edge_attr,
+                        y=data.y,
+                        batch=data.batch,
+                        charge=all_charge,
+                    )
+                    true_data_ph = utils.SparsePlaceHolder(
+                        node=data.x,
+                        edge_index=all_edge_index,
+                        edge_attr=true_attr_gathered,
+                        y=data.y,
+                        batch=data.batch,
+                        charge=data.charge,
+                    )
+                    true_data_ph.collapse()
+                    rml = self.train_loss._relation_matrix_loss(
+                        sparse_pred_ph, true_data_ph
+                    )
+                    mp2 = self.train_loss._metapath2_subtype_loss(
+                        sparse_pred_ph, true_data_ph
+                    )
+                    dgl1 = self.train_loss._subtype_degree_hist_loss(
+                        sparse_pred_ph, true_data_ph
+                    )
+                    v = rml.detach().item()
+                    self._val_relation_matrix_L1_sum += v
+                    self._val_relation_matrix_L1_count += 1
+                    v2 = mp2.detach().item()
+                    self._val_metapath2_L1_sum += v2
+                    self._val_metapath2_L1_count += 1
+                    v3 = dgl1.detach().item()
+                    self._val_subtype_degree_L1_sum += v3
+                    self._val_subtype_degree_L1_count += 1
+            except Exception as _e:
+                if getattr(self, "local_rank", 0) == 0:
+                    print(
+                        f"[VAL-CUSTOM-METRICS] relation_matrix/metapath2/subtype_degree failed: {_e}",
+                        flush=True,
+                    )
+
         nll = self.compute_val_loss(
             dense_pred,
             noisy_data,
@@ -1577,6 +1689,21 @@ class DiscreteDenoisingDiffusion(pl.LightningModule):
             f"Epoch {self.current_epoch}: Val NLL {metrics[0] :.2f} -- Val Atom type KL {metrics[1] :.2f} -- ",
             f"Val Edge type KL: {metrics[2] :.2f}",
         )
+        if self._val_relation_matrix_L1_count > 0:
+            val_rm = self._val_relation_matrix_L1_sum / self._val_relation_matrix_L1_count
+            self.print(f"  Val relation_matrix_L1: {val_rm:.4f}")
+            if wandb.run:
+                wandb.log({"val/relation_matrix_L1": val_rm}, commit=False)
+        if self._val_metapath2_L1_count > 0:
+            val_mp2 = self._val_metapath2_L1_sum / self._val_metapath2_L1_count
+            self.print(f"  Val metapath2_L1: {val_mp2:.4f}")
+            if wandb.run:
+                wandb.log({"val/metapath2_L1": val_mp2}, commit=False)
+        if self._val_subtype_degree_L1_count > 0:
+            val_deg = self._val_subtype_degree_L1_sum / self._val_subtype_degree_L1_count
+            self.print(f"  Val subtype_degree_L1: {val_deg:.4f}")
+            if wandb.run:
+                wandb.log({"val/subtype_degree_L1": val_deg}, commit=False)
 
         # Log val nll with default Lightning logger, so it can be monitored by checkpoint callback
         val_nll = metrics[0] if metrics[0] != -1 else float('inf')
@@ -1591,7 +1718,12 @@ class DiscreteDenoisingDiffusion(pl.LightningModule):
         self.val_counter += 1
         # 用验证集上的预测图算与采样同款的指标（不跑采样也能看到 NumNodesW1, NodeTypesTV, EdgeTypesTV, Disconnected, MeanComponents, MaxComponents 及子类别分布图）
         # 所有 rank 都跑 compute_all_metrics，避免只有 rank 0 算导致 DDP 同步时卡住；wandb 只由 rank 0 写（在 compute_all_metrics 内部已按 local_rank 控制）
-        if getattr(self, "_val_predicted_graphs_list", None) and len(self._val_predicted_graphs_list) > 0:
+        enable_val_pred_metrics = getattr(self.cfg.general, "enable_val_pred_metrics", True)
+        if (
+            enable_val_pred_metrics
+            and getattr(self, "_val_predicted_graphs_list", None)
+            and len(self._val_predicted_graphs_list) > 0
+        ):
             try:
                 self.val_sampling_metrics.reset()
                 pred_concat = utils.concat_sparse_graphs(self._val_predicted_graphs_list)
@@ -1908,63 +2040,66 @@ class DiscreteDenoisingDiffusion(pl.LightningModule):
         else:
             charge_t = data.charge
 
-        # Diffuse sparse nodes and sample sparse node labels
-        probN = data.x.unsqueeze(1) @ Qtb.X[data.batch]  # (N, 1, dx) or (N, dx)
-        # 确保probN是2维: (N, dx)
-        if probN.dim() == 3:
-            probN = probN.squeeze(1)  # (N, dx)
-        elif probN.dim() == 1:
-            probN = probN.unsqueeze(0)  # (1, dx) -> 但这种情况不应该发生
-        
-        # 异质图：限制节点只能在其所属类型的子类别范围内采样（训练和采样保持一致）
-        if self.heterogeneous and hasattr(self.dataset_info, "type_offsets"):
-            type_offsets = self.dataset_info.type_offsets
-            if type_offsets:
-                # 获取当前节点的子类别ID
-                current_node_subtype = data.x.argmax(dim=-1) if data.x.dim() > 1 else data.x.long()  # (N,)
-                
-                num_nodes = current_node_subtype.shape[0]
-                num_subtypes = self.out_dims.X
-                node_type_mask = torch.zeros((num_nodes, num_subtypes), device=self.device)
-                
-                # 计算每个类型的size
-                sorted_types = sorted(type_offsets.items(), key=lambda x: x[1])
-                type_sizes = {}
-                for i, (t_name, off) in enumerate(sorted_types):
-                    if i + 1 < len(sorted_types):
-                        type_sizes[t_name] = sorted_types[i + 1][1] - off
-                    else:
-                        type_sizes[t_name] = num_subtypes - off
-                
-                # 为每个节点生成mask
-                for t_name, offset in sorted_types:
-                    type_size = type_sizes.get(t_name, 0)
-                    if type_size <= 0:
-                        continue
-                    # 找到属于该类型的节点
-                    if t_name == sorted_types[-1][0]:
-                        # 最后一个类型
-                        type_mask = current_node_subtype >= offset
-                    else:
-                        next_offset = sorted_types[sorted_types.index((t_name, offset)) + 1][1]
-                        type_mask = (current_node_subtype >= offset) & (current_node_subtype < next_offset)
+        # Diffuse sparse nodes and sample sparse node labels（structure_only 时不扩散节点，固定为真实节点）
+        if getattr(self, "structure_only", False):
+            node_t = data.x.argmax(dim=-1) if data.x.dim() > 1 else data.x.long()  # (N,)
+        else:
+            probN = data.x.unsqueeze(1) @ Qtb.X[data.batch]  # (N, 1, dx) or (N, dx)
+            # 确保probN是2维: (N, dx)
+            if probN.dim() == 3:
+                probN = probN.squeeze(1)  # (N, dx)
+            elif probN.dim() == 1:
+                probN = probN.unsqueeze(0)  # (1, dx) -> 但这种情况不应该发生
+            
+            # 异质图：限制节点只能在其所属类型的子类别范围内采样（训练和采样保持一致）
+            if self.heterogeneous and hasattr(self.dataset_info, "type_offsets"):
+                type_offsets = self.dataset_info.type_offsets
+                if type_offsets:
+                    # 获取当前节点的子类别ID
+                    current_node_subtype = data.x.argmax(dim=-1) if data.x.dim() > 1 else data.x.long()  # (N,)
                     
-                    if type_mask.any():
-                        # 允许该类型范围内的所有子类别
-                        node_type_mask[type_mask, offset:offset + type_size] = 1.0
-                
-                # 应用mask
-                probN_masked = probN * node_type_mask
-                row_sum = probN_masked.sum(dim=-1, keepdim=True)
-                all_zero = (row_sum.squeeze(-1) == 0)
-                if all_zero.any():
-                    # Fallback: use original probabilities for masked nodes (should not happen)
-                    probN_masked[all_zero] = probN[all_zero]
-                probN = probN_masked / probN_masked.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-        
-        # probN shape: (N, dx) - 确保是2维
-        assert probN.dim() == 2, f"probN should be 2D, got {probN.dim()}D with shape {probN.shape}"
-        node_t = probN.multinomial(1).flatten()  # (N, )
+                    num_nodes = current_node_subtype.shape[0]
+                    num_subtypes = self.out_dims.X
+                    node_type_mask = torch.zeros((num_nodes, num_subtypes), device=self.device)
+                    
+                    # 计算每个类型的size
+                    sorted_types = sorted(type_offsets.items(), key=lambda x: x[1])
+                    type_sizes = {}
+                    for i, (t_name, off) in enumerate(sorted_types):
+                        if i + 1 < len(sorted_types):
+                            type_sizes[t_name] = sorted_types[i + 1][1] - off
+                        else:
+                            type_sizes[t_name] = num_subtypes - off
+                    
+                    # 为每个节点生成mask
+                    for t_name, offset in sorted_types:
+                        type_size = type_sizes.get(t_name, 0)
+                        if type_size <= 0:
+                            continue
+                        # 找到属于该类型的节点
+                        if t_name == sorted_types[-1][0]:
+                            # 最后一个类型
+                            type_mask = current_node_subtype >= offset
+                        else:
+                            next_offset = sorted_types[sorted_types.index((t_name, offset)) + 1][1]
+                            type_mask = (current_node_subtype >= offset) & (current_node_subtype < next_offset)
+                        
+                        if type_mask.any():
+                            # 允许该类型范围内的所有子类别
+                            node_type_mask[type_mask, offset:offset + type_size] = 1.0
+                    
+                    # 应用mask
+                    probN_masked = probN * node_type_mask
+                    row_sum = probN_masked.sum(dim=-1, keepdim=True)
+                    all_zero = (row_sum.squeeze(-1) == 0)
+                    if all_zero.any():
+                        # Fallback: use original probabilities for masked nodes (should not happen)
+                        probN_masked[all_zero] = probN[all_zero]
+                    probN = probN_masked / probN_masked.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            
+            # probN shape: (N, dx) - 确保是2维
+            assert probN.dim() == 2, f"probN should be 2D, got {probN.dim()}D with shape {probN.shape}"
+            node_t = probN.multinomial(1).flatten()  # (N, )
         # count node numbers and edge numbers for existing edges for each graph
         num_nodes = data.ptr.diff().long()
         batch_edge = data.batch[data.edge_index[0]]
@@ -2336,14 +2471,18 @@ class DiscreteDenoisingDiffusion(pl.LightningModule):
                 f"[NOISE] total_dir_edges={total_dir_edges}, "
                 f"noisy_before_mask={total_noisy_before}, noisy_after_mask={total_noisy_after}"
             )
-            # overlap ratio between original directed edges and noisy directed edges
+            # overlap ratio between original directed edges and noisy directed edges (GPU, no .tolist())
             try:
-                orig_edges = dir_edge_index.t().tolist()
-                noisy_edges = E_t_index[:, mask].t().tolist()
-                orig_set = set((u, v) for u, v in orig_edges)
-                noisy_set = set((u, v) for u, v in noisy_edges)
-                overlap = len(orig_set & noisy_set)
-                overlap_ratio = overlap / len(orig_set) * 100 if orig_set else 0.0
+                n_max = max(
+                    int(dir_edge_index.max().item()),
+                    int(E_t_index[0, mask].max().item()) if mask.any() else 0,
+                    int(E_t_index[1, mask].max().item()) if mask.any() else 0,
+                ) + 1
+                orig_flat = dir_edge_index[0].long() * n_max + dir_edge_index[1].long()
+                noisy_flat = E_t_index[0, mask].long() * n_max + E_t_index[1, mask].long()
+                overlap = int(torch.isin(orig_flat, noisy_flat).sum().item())
+                n_orig = orig_flat.shape[0]
+                overlap_ratio = (overlap / n_orig * 100.0) if n_orig > 0 else 0.0
                 print(
                     f"[NOISE] overlap_original={overlap} "
                     f"({overlap_ratio:.1f}%)"
@@ -2923,12 +3062,15 @@ class DiscreteDenoisingDiffusion(pl.LightningModule):
             true_charge=prob_true.charge,
             pred_charge=prob_pred.charge,
         )
-        kl_x = (self.test_X_kl if test else self.val_X_kl)(
-            prob_true_X, torch.log(prob_pred.X)
-        )
         kl_e = (self.test_E_kl if test else self.val_E_kl)(
             prob_true_E, torch.log(prob_pred.E)
         )
+        if getattr(self, "structure_only", False):
+            kl_x = torch.zeros_like(kl_e, device=prob_true_X.device)  # 不评估节点
+        else:
+            kl_x = (self.test_X_kl if test else self.val_X_kl)(
+                prob_true_X, torch.log(prob_pred.X)
+            )
 
         assert (~(kl_x + kl_e).isnan()).any()
         loss = kl_x + kl_e
@@ -4374,8 +4516,11 @@ class DiscreteDenoisingDiffusion(pl.LightningModule):
                         prob_has_edge = pred_probs[:, 1:].sum(dim=1).mean().item()
                         max_prob_has_edge = pred_probs[:, 1:].max(dim=1)[0].mean().item()  # 平均最大有边概率
                         print(f"[DEBUG] t={t_float[0].item():.2f}: 平均预测概率 - no-edge={prob_no_edge:.4f}, 有边={prob_has_edge:.4f}, 最大有边概率={max_prob_has_edge:.4f}")
-            # get nodes, charges adn edge index
-            new_node = sampled_node
+            # get nodes, charges adn edge index（structure_only 时节点固定，不采样子类型）
+            if getattr(self, "structure_only", False):
+                new_node = anchor_node_subtype
+            else:
+                new_node = sampled_node
             new_charge = sampled_charge if self.use_charge else charge
             sampled_edge_index = comp_edge_index[:, query_mask]
 

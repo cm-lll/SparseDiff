@@ -1,10 +1,13 @@
 #!/bin/bash
-# ACM 四卡训练：强制使用 GPU 1,2,3,4（避免占用 GPU 0）
+# ACM 训练：默认使用 GPU 1,2,3,4（避免占用 GPU 0）
+# 若外部已设置 CUDA_VISIBLE_DEVICES，则尊重外部设置（便于换卡/共享机器时手动选卡）
 set -e
 cd "$(dirname "$0")"
 
-export CUDA_VISIBLE_DEVICES=1,2,3,4
-echo "Using GPUs: CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    export CUDA_VISIBLE_DEVICES=1,2,3,4
+fi
+echo "Using GPUs: CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 
 if [ -f ~/miniconda3/etc/profile.d/conda.sh ]; then
     source ~/miniconda3/etc/profile.d/conda.sh

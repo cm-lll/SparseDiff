@@ -27,6 +27,9 @@ autoregressive: False
 # 边采样：True=先采样存在性再采样子类型（与分层损失一致，避免 no-edge 单类 > 有边总和时仍被选）；异质图默认 True
 hierarchical_edge_sampling: True
 
+# 只关注结构：固定节点、仅边扩散，损失仅用 relation_matrix_L1 + metapath2_L1（多阶结构），不做节点/边一一 CE
+structure_only: true
+
 # 异质图节点嵌入调制方式（边关系预测以子类别为基底）
 # use_type_modulation: True  -> Q = (1 + γ_Q(T)) ⊙ W^Q_t X + β_Q(T)，类别调制子类别
 # use_type_modulation: False -> Q = W^Q_t X，纯子类别基底，无类别调制
@@ -39,3 +42,11 @@ hidden_dims : {'dx': 256, 'de': 64, 'dy': 64, 'n_head': 8, 'dim_ffX': 512, 'dim_
 # dim_ffX	节点分支里 FFN 的中间维。
 lambda_train: [5, 0, 2] # 这是训练总损失里各项的权重（节点损失固定为 1，不写进列表）, E = lambda[0], y = lambda[1]
 # loss = loss_X + lambda_train[0]*loss_E + lambda_train[1]*loss_y + lambda_train[2]*loss_charge
+relation_matrix_loss_weight: 0.0  # 子类别对外关系矩阵损失权重（建议先用 0.05~0.2 试）
+relation_matrix_loss_normalize: true  # 对矩阵计数按总量归一化后再算 L1
+use_edge_subtype_ce: false  # 关闭边子类别CE，仅保留存在性与结构统计损失
+metapath2_loss_weight: 0.05  # 二跳meta-path子类别分布损失权重
+metapath2_loss_normalize: true
+subtype_degree_loss_weight: 0.05  # 子类别级度分布损失权重（非个体节点）
+subtype_degree_loss_normalize: true  # 按每个子类别内的度直方图归一化再算L1
+subtype_degree_max: 10  # 度分桶上限，最后一桶为 > max

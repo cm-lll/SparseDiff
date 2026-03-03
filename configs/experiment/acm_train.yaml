@@ -7,6 +7,8 @@ general:
     sparse: True
     gpus : 4
     wandb: 'online'
+    enable_val_sampling: false        # 关闭验证阶段“采样生成图”（sample_batch）
+    enable_val_pred_metrics: false    # 关闭验证阶段“预测图”采样指标（日志里显示 Sampling metrics 预测）
     sample_every_val: 5
     samples_to_generate: 10
     samples_to_save: 5

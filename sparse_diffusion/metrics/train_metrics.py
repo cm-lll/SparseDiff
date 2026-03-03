@@ -7,8 +7,23 @@ from sparse_diffusion.metrics.abstract_metrics import CrossEntropyMetric, Masked
 class TrainLossDiscrete(nn.Module):
     """Train with Cross entropy"""
 
-    def __init__(self, lambda_train, edge_fraction, dataset_info=None):
+    def __init__(
+        self,
+        lambda_train,
+        edge_fraction,
+        dataset_info=None,
+        relation_matrix_loss_weight=0.0,
+        relation_matrix_loss_normalize=True,
+        use_edge_subtype_ce=True,
+        metapath2_loss_weight=0.0,
+        metapath2_loss_normalize=True,
+        structure_only=False,
+        subtype_degree_loss_weight=0.0,
+        subtype_degree_loss_normalize=True,
+        subtype_degree_max=10,
+    ):
         super().__init__()
+        self.structure_only = bool(structure_only)
         self.node_loss = CrossEntropyMetric()
         self.edge_loss = CrossEntropyMetric()
         self.edge_pos_acc = MaskedAccuracy(ignore_index=0)
@@ -51,6 +66,20 @@ class TrainLossDiscrete(nn.Module):
         self.edge_pos_ce_samples = None
         self.edge_neg_ce_total = None
         self.edge_neg_ce_samples = None
+        self.relation_matrix_loss_weight = float(relation_matrix_loss_weight)
+        self.relation_matrix_loss_normalize = bool(relation_matrix_loss_normalize)
+        self.relation_matrix_loss_total = None
+        self.relation_matrix_loss_steps = None
+        self.use_edge_subtype_ce = bool(use_edge_subtype_ce)
+        self.metapath2_loss_weight = float(metapath2_loss_weight)
+        self.metapath2_loss_normalize = bool(metapath2_loss_normalize)
+        self.metapath2_loss_total = None
+        self.metapath2_loss_steps = None
+        self.subtype_degree_loss_weight = float(subtype_degree_loss_weight)
+        self.subtype_degree_loss_normalize = bool(subtype_degree_loss_normalize)
+        self.subtype_degree_max = int(subtype_degree_max)
+        self.subtype_degree_loss_total = None
+        self.subtype_degree_loss_steps = None
 
         if (
             dataset_info is not None
@@ -94,7 +123,203 @@ class TrainLossDiscrete(nn.Module):
                     if (next_offset - offset) > 1:
                         self.edge_family_multisub.add(fam_name)
 
+    def _relation_matrix_loss(self, pred, true_data):
+        """Subtype-level outgoing relation matrix loss on query edges."""
+        if pred.edge_attr.numel() == 0 or true_data.edge_attr.numel() == 0:
+            return pred.edge_attr.sum() * 0.0
+        if true_data.node.numel() == 0:
+            return pred.edge_attr.sum() * 0.0
+
+        num_node_subtypes = pred.node.shape[-1]
+        num_edge_types = pred.edge_attr.shape[-1]
+        src = pred.edge_index[0].long()
+        dst = pred.edge_index[1].long()
+
+        src_sub = true_data.node[src].long()
+        dst_sub = true_data.node[dst].long()
+
+        # Build target matrix from true edge labels: M_true[src_sub, dst_sub, edge_type].
+        true_labels = true_data.edge_attr.long()
+        true_flat_idx = (
+            (src_sub * num_node_subtypes + dst_sub) * num_edge_types + true_labels
+        )
+        true_hist = torch.zeros(
+            num_node_subtypes * num_node_subtypes * num_edge_types,
+            device=pred.edge_attr.device,
+            dtype=pred.edge_attr.dtype,
+        )
+        true_hist.scatter_add_(
+            0, true_flat_idx, torch.ones_like(true_flat_idx, dtype=pred.edge_attr.dtype)
+        )
+
+        # Build predicted matrix from edge-type probabilities.
+        pred_prob = torch.softmax(pred.edge_attr, dim=-1)
+        base_pair = (src_sub * num_node_subtypes + dst_sub) * num_edge_types
+        type_offsets = torch.arange(num_edge_types, device=pred.edge_attr.device).view(1, -1)
+        pred_flat_idx = (base_pair.view(-1, 1) + type_offsets).reshape(-1)
+        pred_hist = torch.zeros_like(true_hist)
+        pred_hist.scatter_add_(0, pred_flat_idx, pred_prob.reshape(-1))
+
+        if self.relation_matrix_loss_normalize:
+            true_hist = true_hist / true_hist.sum().clamp(min=1.0)
+            pred_hist = pred_hist / pred_hist.sum().clamp(min=1.0)
+
+        return torch.nn.functional.l1_loss(pred_hist, true_hist, reduction="mean")
+
+    def _metapath2_subtype_loss(self, pred, true_data):
+        """Two-hop subtype transition loss using subtype adjacency composition (A @ A)."""
+        if pred.edge_attr.numel() == 0 or true_data.edge_attr.numel() == 0:
+            return pred.edge_attr.sum() * 0.0
+        if true_data.node.numel() == 0:
+            return pred.edge_attr.sum() * 0.0
+
+        src = pred.edge_index[0].long()
+        dst = pred.edge_index[1].long()
+        if src.numel() == 0:
+            return pred.edge_attr.sum() * 0.0
+
+        node_sub = true_data.node.long()
+        num_sub = pred.node.shape[-1]
+        device = pred.edge_attr.device
+        dtype = pred.edge_attr.dtype
+
+        # Predicted edge existence probability P(edge exists) = 1 - P(no-edge).
+        pred_prob = torch.softmax(pred.edge_attr, dim=-1)
+        pred_exist = 1.0 - pred_prob[:, 0]
+
+        # True edge existence indicator.
+        true_labels = true_data.edge_attr.long()
+        true_exist = (true_labels > 0).to(dtype=dtype)
+        src_sub = node_sub[src]
+        dst_sub = node_sub[dst]
+
+        # Build subtype-level adjacency matrices A_true / A_pred with O(E) scatter.
+        flat_idx = src_sub * num_sub + dst_sub
+        A_true = torch.zeros(num_sub * num_sub, device=device, dtype=dtype)
+        A_pred = torch.zeros(num_sub * num_sub, device=device, dtype=dtype)
+        A_true.scatter_add_(0, flat_idx, true_exist)
+        A_pred.scatter_add_(0, flat_idx, pred_exist)
+        A_true = A_true.view(num_sub, num_sub)
+        A_pred = A_pred.view(num_sub, num_sub)
+
+        if self.metapath2_loss_normalize:
+            A_true = A_true / A_true.sum().clamp(min=1.0)
+            A_pred = A_pred / A_pred.sum().clamp(min=1.0)
+
+        # Two-hop subtype transitions.
+        B_true = A_true @ A_true
+        B_pred = A_pred @ A_pred
+
+        if self.metapath2_loss_normalize:
+            B_true = B_true / B_true.sum().clamp(min=1.0)
+            B_pred = B_pred / B_pred.sum().clamp(min=1.0)
+
+        return torch.nn.functional.l1_loss(B_pred, B_true, reduction="mean")
+
+    def _subtype_degree_hist_loss(self, pred, true_data):
+        """Subtype-level degree distribution loss (histogram over total degree)."""
+        if pred.edge_attr.numel() == 0 or true_data.edge_attr.numel() == 0:
+            return pred.edge_attr.sum() * 0.0
+        if true_data.node.numel() == 0:
+            return pred.edge_attr.sum() * 0.0
+
+        src = pred.edge_index[0].long()
+        dst = pred.edge_index[1].long()
+        if src.numel() == 0:
+            return pred.edge_attr.sum() * 0.0
+
+        node_sub = true_data.node.long()
+        num_sub = pred.node.shape[-1]
+        num_nodes = node_sub.shape[0]
+        device = pred.edge_attr.device
+        dtype = pred.edge_attr.dtype
+        num_bins = self.subtype_degree_max + 2  # 0..max_degree plus overflow
+
+        pred_prob = torch.softmax(pred.edge_attr, dim=-1)
+        pred_exist = 1.0 - pred_prob[:, 0]
+        true_labels = true_data.edge_attr.long()
+        true_exist = (true_labels > 0).to(dtype=dtype)
+
+        true_deg = torch.zeros(num_nodes, device=device, dtype=dtype)
+        pred_deg = torch.zeros(num_nodes, device=device, dtype=dtype)
+        true_deg.scatter_add_(0, src, true_exist)
+        true_deg.scatter_add_(0, dst, true_exist)
+        pred_deg.scatter_add_(0, src, pred_exist)
+        pred_deg.scatter_add_(0, dst, pred_exist)
+
+        true_bin = true_deg.round().long().clamp(min=0, max=num_bins - 1)
+        true_hist = torch.zeros(num_sub * num_bins, device=device, dtype=dtype)
+        true_flat_idx = node_sub * num_bins + true_bin
+        true_hist.scatter_add_(
+            0, true_flat_idx, torch.ones_like(true_flat_idx, dtype=dtype)
+        )
+        true_hist = true_hist.view(num_sub, num_bins)
+
+        pred_hist = torch.zeros(num_sub * num_bins, device=device, dtype=dtype)
+        deg_cap = float(num_bins - 1)
+        pred_deg_cap = pred_deg.clamp(min=0.0, max=deg_cap)
+        low = torch.floor(pred_deg_cap).long()
+        high = torch.clamp(low + 1, max=num_bins - 1)
+        w_high = (pred_deg_cap - low.to(dtype=dtype)).clamp(min=0.0, max=1.0)
+        w_low = 1.0 - w_high
+        low_idx = node_sub * num_bins + low
+        high_idx = node_sub * num_bins + high
+        pred_hist.scatter_add_(0, low_idx, w_low)
+        pred_hist.scatter_add_(0, high_idx, w_high)
+        pred_hist = pred_hist.view(num_sub, num_bins)
+
+        active_rows = true_hist.sum(dim=1) > 0
+        if not active_rows.any():
+            return pred.edge_attr.sum() * 0.0
+
+        if self.subtype_degree_loss_normalize:
+            true_row_sum = true_hist.sum(dim=1, keepdim=True).clamp(min=1.0)
+            pred_row_sum = pred_hist.sum(dim=1, keepdim=True).clamp(min=1.0)
+            true_hist = true_hist / true_row_sum
+            pred_hist = pred_hist / pred_row_sum
+
+        return torch.nn.functional.l1_loss(
+            pred_hist[active_rows], true_hist[active_rows], reduction="mean"
+        )
+
     def forward(self, pred, true_data, log: bool):
+        if self.structure_only:
+            loss_X = 0.0
+            loss_E = 0.0
+            relation_matrix_loss = self._relation_matrix_loss(pred, true_data)
+            metapath2_loss = self._metapath2_subtype_loss(pred, true_data)
+            subtype_degree_loss = self._subtype_degree_hist_loss(pred, true_data)
+            device = relation_matrix_loss.device
+            if self.relation_matrix_loss_total is None:
+                self.relation_matrix_loss_total = torch.tensor(0.0, device=device)
+                self.relation_matrix_loss_steps = torch.tensor(0.0, device=device)
+            if self.metapath2_loss_total is None:
+                self.metapath2_loss_total = torch.tensor(0.0, device=device)
+                self.metapath2_loss_steps = torch.tensor(0.0, device=device)
+            if self.subtype_degree_loss_total is None:
+                self.subtype_degree_loss_total = torch.tensor(0.0, device=device)
+                self.subtype_degree_loss_steps = torch.tensor(0.0, device=device)
+            self.relation_matrix_loss_total += relation_matrix_loss.detach()
+            self.relation_matrix_loss_steps += 1.0
+            self.metapath2_loss_total += metapath2_loss.detach()
+            self.metapath2_loss_steps += 1.0
+            self.subtype_degree_loss_total += subtype_degree_loss.detach()
+            self.subtype_degree_loss_steps += 1.0
+            if log:
+                to_log = {}
+                if self.relation_matrix_loss_weight > 0:
+                    to_log["train_loss/relation_matrix_L1"] = relation_matrix_loss.detach()
+                if self.metapath2_loss_weight > 0:
+                    to_log["train_loss/metapath2_L1"] = metapath2_loss.detach()
+                if self.subtype_degree_loss_weight > 0:
+                    to_log["train_loss/subtype_degree_L1"] = subtype_degree_loss.detach()
+                if wandb.run:
+                    wandb.log(to_log, commit=True)
+            return (
+                self.relation_matrix_loss_weight * relation_matrix_loss
+                + self.metapath2_loss_weight * metapath2_loss
+                + self.subtype_degree_loss_weight * subtype_degree_loss
+            )
         loss_X = (
             self.node_loss(pred.node, true_data.node)
             if true_data.node.numel() > 0
@@ -130,6 +355,12 @@ class TrainLossDiscrete(nn.Module):
             self.edge_pos_ce_samples = torch.tensor(0.0, device=device)
             self.edge_neg_ce_total = torch.tensor(0.0, device=device)
             self.edge_neg_ce_samples = torch.tensor(0.0, device=device)
+            self.relation_matrix_loss_total = torch.tensor(0.0, device=device)
+            self.relation_matrix_loss_steps = torch.tensor(0.0, device=device)
+            self.metapath2_loss_total = torch.tensor(0.0, device=device)
+            self.metapath2_loss_steps = torch.tensor(0.0, device=device)
+            self.subtype_degree_loss_total = torch.tensor(0.0, device=device)
+            self.subtype_degree_loss_steps = torch.tensor(0.0, device=device)
             # 负边准确率指标（用于自适应权重调整）
             self.edge_neg_exist_correct = torch.tensor(0.0, device=device)
             self.edge_neg_exist_total = torch.tensor(0.0, device=device)
@@ -212,7 +443,7 @@ class TrainLossDiscrete(nn.Module):
         loss_exist = (alpha_exist * (1.0 - pt_exist) ** gamma_exist * ce_exist).sum()
 
         loss_subtype = pred_edge_flat.sum() * 0.0
-        if self.edge_family_ranges and self.edge_family_multisub:
+        if self.use_edge_subtype_ce and self.edge_family_ranges and self.edge_family_multisub:
             for fam_name, (st, en) in self.edge_family_ranges.items():
                 if fam_name not in self.edge_family_multisub:
                     continue
@@ -257,6 +488,18 @@ class TrainLossDiscrete(nn.Module):
                 self.edge_neg_ce_samples += neg_mask.sum().float()
         loss_y = 0.0
         loss_charge = self.charge_loss(pred.charge, true_data.charge) if pred.charge.numel() > 0 else 0.0
+        relation_matrix_loss = self._relation_matrix_loss(pred, true_data)
+        if self.relation_matrix_loss_total is not None:
+            self.relation_matrix_loss_total += relation_matrix_loss.detach()
+            self.relation_matrix_loss_steps += 1.0
+        metapath2_loss = self._metapath2_subtype_loss(pred, true_data)
+        if self.metapath2_loss_total is not None:
+            self.metapath2_loss_total += metapath2_loss.detach()
+            self.metapath2_loss_steps += 1.0
+        subtype_degree_loss = self._subtype_degree_hist_loss(pred, true_data)
+        if self.subtype_degree_loss_total is not None:
+            self.subtype_degree_loss_total += subtype_degree_loss.detach()
+            self.subtype_degree_loss_steps += 1.0
 
         if log:
             to_log = {}
@@ -270,6 +513,12 @@ class TrainLossDiscrete(nn.Module):
                 to_log["train_loss/E_pos_CE"] = (self.edge_pos_ce_total / self.edge_pos_ce_samples).item()
             if self.edge_neg_ce_samples is not None and self.edge_neg_ce_samples > 0:
                 to_log["train_loss/E_neg_CE"] = (self.edge_neg_ce_total / self.edge_neg_ce_samples).item()
+            if self.relation_matrix_loss_weight > 0:
+                to_log["train_loss/relation_matrix_L1"] = relation_matrix_loss.detach()
+            if self.metapath2_loss_weight > 0:
+                to_log["train_loss/metapath2_L1"] = metapath2_loss.detach()
+            if self.subtype_degree_loss_weight > 0:
+                to_log["train_loss/subtype_degree_L1"] = subtype_degree_loss.detach()
             # 准确率指标
             if self.edge_pos_exist_total is not None and self.edge_pos_exist_total > 0:
                 to_log["train_acc/E_pos_exist_acc"] = self.edge_pos_exist_correct / self.edge_pos_exist_total
@@ -289,6 +538,9 @@ class TrainLossDiscrete(nn.Module):
             + self.lambda_train[0] * loss_E
             + self.lambda_train[1] * loss_y
             + self.lambda_train[2] * loss_charge
+            + self.relation_matrix_loss_weight * relation_matrix_loss
+            + self.metapath2_loss_weight * metapath2_loss
+            + self.subtype_degree_loss_weight * subtype_degree_loss
         )
 
     def reset(self):
@@ -309,6 +561,12 @@ class TrainLossDiscrete(nn.Module):
         self.edge_pos_ce_samples = None
         self.edge_neg_ce_total = None
         self.edge_neg_ce_samples = None
+        self.relation_matrix_loss_total = None
+        self.relation_matrix_loss_steps = None
+        self.metapath2_loss_total = None
+        self.metapath2_loss_steps = None
+        self.subtype_degree_loss_total = None
+        self.subtype_degree_loss_steps = None
 
     def log_epoch_metrics(self, log_step=None):
         """log_step: 若传入（如 current_epoch），wandb 横轴为该值，便于「每 epoch 一条」显示为 0,1,2,..."""
@@ -411,7 +669,7 @@ class TrainLossDiscrete(nn.Module):
             else -1
         )
         epoch_y_loss = (
-            self.train_y_loss.compute() if self.y_loss.total_samples > 0 else -1
+            self.y_loss.compute() if self.y_loss.total_samples > 0 else -1
         )
         epoch_charge_loss = (
             self.charge_loss.compute() if self.charge_loss.total_samples > 0 else -1
@@ -428,6 +686,33 @@ class TrainLossDiscrete(nn.Module):
             to_log["train_epoch/E_pos_CE"] = (self.edge_pos_ce_total / self.edge_pos_ce_samples).item()
         if self.edge_neg_ce_samples is not None and self.edge_neg_ce_samples > 0:
             to_log["train_epoch/E_neg_CE"] = (self.edge_neg_ce_total / self.edge_neg_ce_samples).item()
+        if (
+            self.relation_matrix_loss_weight > 0
+            and self.relation_matrix_loss_total is not None
+            and self.relation_matrix_loss_steps is not None
+            and self.relation_matrix_loss_steps > 0
+        ):
+            to_log["train_epoch/relation_matrix_L1"] = (
+                self.relation_matrix_loss_total / self.relation_matrix_loss_steps
+            ).item()
+        if (
+            self.metapath2_loss_weight > 0
+            and self.metapath2_loss_total is not None
+            and self.metapath2_loss_steps is not None
+            and self.metapath2_loss_steps > 0
+        ):
+            to_log["train_epoch/metapath2_L1"] = (
+                self.metapath2_loss_total / self.metapath2_loss_steps
+            ).item()
+        if (
+            self.subtype_degree_loss_weight > 0
+            and self.subtype_degree_loss_total is not None
+            and self.subtype_degree_loss_steps is not None
+            and self.subtype_degree_loss_steps > 0
+        ):
+            to_log["train_epoch/subtype_degree_L1"] = (
+                self.subtype_degree_loss_total / self.subtype_degree_loss_steps
+            ).item()
         # 准确率指标
         if epoch_edge_pos_exist_acc != -1:
             to_log["train_epoch/E_pos_exist_acc"] = epoch_edge_pos_exist_acc
